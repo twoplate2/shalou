@@ -224,6 +224,8 @@ __pycache__/
 | 闪屏后黑屏 | `presplash_color` ≠ app 背景 | spec 改 `android.presplash_color = #你的BG色` |
 | **APK 装手机后所有汉字显示为豆腐块/乱码** | Android 系统不带中文字体,Kivy 默认 Roboto 字体不含 CJK 字形 | 项目里加 `fonts/NotoSansSC-Medium.otf`(~8MB,见下方[中文字体配置](#-中文字体配置)) + `LabelBase.register(name="Roboto", fn_regular=...)` 覆盖默认字体 + spec `source.include_patterns` 加 `fonts/*.otf` |
 | App 切后台回来 GL 黑屏 | 没实现生命周期 | `on_pause` 返 True, `on_resume` 重载音频/纹理 |
+| **Android 上短 wav 循环每隔几秒"咔"一下/有断续** | Kivy `SoundLoader` 在 Android 底层走 Java `MediaPlayer.setLooping(True)`,该 API 循环短音频每次切换有 50-100ms 静音 gap | 用 `pyjnius` 调 `android.media.SoundPool`(为短音效设计,内存预解码 + 硬件循环,无缝重复)。`requirements` 加 `pyjnius`,见下方[音效无缝循环](#-音效无缝循环-android) |
+| **TextInput 文字无法居中** (没有 `text_align` 属性) | Kivy `TextInput` 设计缺陷,只暴露 `padding` 没暴露 `align` | 写子类用 `CoreLabel` 测真实文本宽度 → 动态计算 `padding=[(w-tw)/2, (h-th)/2, ...]`,bind `text`/`size`/`font_size` 自动刷新 |
 | Windows 双击 .py 闪退 | tk.Frame 的 padx/pady 不接受 tuple | 把 padx/pady 移到 `pack()` 调用,或换 ttk.Frame.padding |
 
 ---
@@ -412,6 +414,149 @@ source.include_patterns = sand_loop.wav,fonts/*.otf
 | 微软雅黑 / 黑体 (`msyh.ttc`) | ~15MB+ | **商业字体,不可分发** | 不要用 |
 
 ⚠️ **不要用 Windows 自带的微软雅黑、黑体、宋体**——这些是商业字体,把它们打包进 APK 上传 GitHub 公开仓库属于侵权。Noto Sans SC 是 Apache 2.0,可放心商用 + 公开分发。
+
+---
+
+## 🔊 音效无缝循环 (Android)
+
+### 现象
+
+短 wav (1-3 秒) 想做循环播放(背景白噪声、滴答声、沙沙声等),桌面 (Windows winsound `SND_LOOP` 或 Linux SDL2) 完全无缝,**但装到 Android 后每次循环边界有可听见的"咔"或几十毫秒静音断续**。
+
+### 根因
+
+Kivy `SoundLoader` 在 Android 上的 backend 是 `audio_android.SoundAudioPlayer`,底层调用 Java `MediaPlayer.setLooping(True)`。MediaPlayer 是 Android 给**长音频流**(歌曲、视频音轨)用的 API,循环时:
+
+```
+当前播放完 → 内部 buffer drain → seek to 0 → re-fill buffer → resume play
+            └────── 这段总耗时 50-100ms,期间静音 ──────┘
+```
+
+短音频(< 5s)循环时 gap 占比高,人耳明显察觉。**这是 MediaPlayer API 的固有行为,不是 Kivy 的 bug**,设 `loop=True` 也救不回来。
+
+### ✅ 标准解法: `SoundPool` API
+
+Android 专门为短音效循环设计了 `SoundPool` API:
+- 加载时**整个音频解压到内存**(不是流式 buffer)
+- 循环点由硬件 audio mixer 直接处理,**真正无 gap**
+- 同时支持多路并发(适合游戏音效)
+
+但 SoundPool 没有 Java 之外的 Python 绑定,需要用 **pyjnius** 直接调 Android Java API。
+
+#### 第 1 步: `buildozer.spec` 加 `pyjnius`
+
+```ini
+requirements = python3,kivy==2.3.0,pyjnius
+```
+
+> pyjnius 实际上是 Kivy/p4a 在 Android 上的隐式依赖(已经存在于 APK 中),显式加一行让 buildozer 跳过自动检测,加速构建。
+
+#### 第 2 步: `main.py` 实现统一接口
+
+```python
+from kivy.utils import platform
+
+class _SoundProxy:
+    """Android 用 SoundPool 无 gap 循环,桌面 fallback 到 Kivy SoundLoader"""
+
+    def __init__(self, wav_path):
+        self._is_android = (platform == "android")
+        self._sp = None
+        self._sound_id = None
+        self._stream_id = 0
+        self._loaded = False
+        self._listener = None  # 防 PythonJavaClass 被 GC
+        self._kivy_sound = None
+
+        if self._is_android:
+            try:
+                self._init_soundpool(wav_path)
+                return
+            except Exception:
+                self._sp = None  # 任何失败 → fallback
+
+        try:
+            from kivy.core.audio import SoundLoader
+            self._kivy_sound = SoundLoader.load(wav_path)
+            if self._kivy_sound is not None:
+                self._kivy_sound.loop = True
+        except Exception:
+            self._kivy_sound = None
+
+    def _init_soundpool(self, wav_path):
+        from jnius import autoclass, PythonJavaClass, java_method
+        SoundPool = autoclass('android.media.SoundPool')
+        AudioAttributes = autoclass('android.media.AudioAttributes')
+
+        attrs = (AudioAttributes.Builder()
+                 .setUsage(AudioAttributes.USAGE_MEDIA)
+                 .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                 .build())
+        self._sp = (SoundPool.Builder()
+                    .setMaxStreams(1)
+                    .setAudioAttributes(attrs)
+                    .build())
+        self._sound_id = self._sp.load(wav_path, 1)
+
+        outer = self
+        class _Listener(PythonJavaClass):
+            __javainterfaces__ = ['android/media/SoundPool$OnLoadCompleteListener']
+            __javacontext__ = 'app'
+
+            @java_method('(Landroid/media/SoundPool;II)V')
+            def onLoadComplete(self, soundpool, sample_id, status):
+                if status == 0:
+                    outer._loaded = True
+
+        self._listener = _Listener()
+        self._sp.setOnLoadCompleteListener(self._listener)
+
+    def play(self):
+        if self._sp is not None:
+            if self._stream_id:  # 已经在播
+                return
+            if self._loaded:
+                # play(soundID, leftVol, rightVol, priority, loop=-1 永久, rate)
+                self._stream_id = self._sp.play(self._sound_id, 1.0, 1.0, 1, -1, 1.0)
+            return
+        if self._kivy_sound is not None:
+            try:
+                if self._kivy_sound.state != "play":
+                    self._kivy_sound.play()
+            except Exception:
+                pass
+
+    def stop(self):
+        if self._sp is not None:
+            if self._stream_id:
+                try: self._sp.stop(self._stream_id)
+                except Exception: pass
+                self._stream_id = 0
+            return
+        if self._kivy_sound is not None:
+            try: self._kivy_sound.stop()
+            except Exception: pass
+```
+
+### 关键细节
+
+| 细节 | 为什么 |
+|---|---|
+| `self._listener` 存到实例属性 | `PythonJavaClass` 被 Java 端持有但 Python 端只在 `_init_soundpool` 局部 → Python GC 回收后 Java 端 callback 会崩溃。**必须存到实例属性**防 GC |
+| `play()` 第 5 参数 `-1` | SoundPool 的 loop 参数: `0`=播一次, `>0`=重复 N 次, **`-1`=永久循环** |
+| `SoundPool.load()` 是异步的 | 必须等 `OnLoadCompleteListener.onLoadComplete` 回调 status=0 才能 play(),否则 play 会静默失败 |
+| 文件大小限制 | SoundPool 默认对单个样本有内存上限(经验值 1MB 解压后),长于 30 秒的音频用错了 API,改用 `MediaPlayer` 流式 |
+| 桌面 fallback | `from jnius import ...` 在 Windows 会 ImportError,顶层 try/except 兜底自动走 `SoundLoader` |
+
+### 备选方案 (没 SoundPool 那么完美但更简单)
+
+如果不想引入 pyjnius:
+
+1. **延长 wav 文件**: 把 2s 的 sand_loop.wav 拉长到 10-30s,循环 gap 出现频次降到每 30 秒一次,听感上能接受
+2. **双 SoundLoader 实例对换**: 用 `Clock.schedule_once` 在快播完前 0.1s 启动第二个实例,可以掩盖 gap,但同步精度难控
+3. **OGG 替代 WAV**: 没用,gap 来自 MediaPlayer API 本身,不是解码格式问题
+
+只有 SoundPool 能做到真无 gap。
 
 ---
 

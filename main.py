@@ -11,7 +11,7 @@ import time
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.audio import SoundLoader
-from kivy.core.text import LabelBase
+from kivy.core.text import LabelBase, Label as CoreLabel
 from kivy.core.window import Window
 from kivy.graphics import Color, Rectangle, Line, Quad
 from kivy.metrics import dp, sp
@@ -52,7 +52,7 @@ BG_COLOR = "#fdf6e3"
 GLASS_FILL = "#eaf3f8"
 WOOD_FILL = "#8b6f47"
 
-MOUND_MAX_FILL = 0.75
+MOUND_MAX_FILL = 1.0
 WAV_FILENAME = "sand_loop.wav"
 
 
@@ -70,6 +70,122 @@ def fg_for(hex_color):
     r, g, b = hex_rgb(hex_color)
     luma = r * 0.299 + g * 0.587 + b * 0.114
     return (0, 0, 0, 1) if luma > 0.59 else (1, 1, 1, 1)
+
+
+class CenterTextInput(TextInput):
+    """让 TextInput 文字水平+垂直居中(Kivy 原生 TextInput 默认左对齐顶对齐,无 align 属性)"""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.bind(text=self._refresh_pad,
+                  size=self._refresh_pad,
+                  font_size=self._refresh_pad)
+        Clock.schedule_once(self._refresh_pad, 0)
+
+    def _refresh_pad(self, *_):
+        try:
+            cl = CoreLabel(text=self.text or "0",
+                           font_size=self.font_size,
+                           font_name=self.font_name or "Roboto")
+            cl.refresh()
+            tw, th = cl.content_size
+        except Exception:
+            tw, th = 0, 0
+        pad_h = max(2, (self.width - tw) / 2)
+        pad_v = max(2, (self.height - th) / 2)
+        self.padding = [pad_h, pad_v, pad_h, pad_v]
+
+
+class _SoundProxy:
+    """统一音效接口:Android 用 SoundPool 实现无 gap 循环,桌面 fallback 到 Kivy SoundLoader.
+
+    Android 默认 SoundLoader 底层走 Java MediaPlayer.setLooping(True),循环短音频每次切换
+    有 50-100ms 静音 gap → 用户听到沙沙声断续。SoundPool 是 Android 官方为短音效设计的
+    API,内存预解码 + 硬件循环,做到无缝重复。
+    """
+
+    def __init__(self, wav_path):
+        self._is_android = (platform == "android")
+        self._sp = None
+        self._sound_id = None
+        self._stream_id = 0
+        self._loaded = False
+        self._listener = None  # 防 PythonJavaClass 被 GC
+        self._kivy_sound = None
+
+        if self._is_android:
+            try:
+                self._init_soundpool(wav_path)
+                return
+            except Exception:
+                self._sp = None  # 任何失败 → fallback
+
+        try:
+            from kivy.core.audio import SoundLoader
+            self._kivy_sound = SoundLoader.load(wav_path)
+            if self._kivy_sound is not None:
+                self._kivy_sound.loop = True
+        except Exception:
+            self._kivy_sound = None
+
+    def _init_soundpool(self, wav_path):
+        from jnius import autoclass, PythonJavaClass, java_method
+        SoundPool = autoclass('android.media.SoundPool')
+        AudioAttributes = autoclass('android.media.AudioAttributes')
+
+        attrs = (AudioAttributes.Builder()
+                 .setUsage(AudioAttributes.USAGE_MEDIA)
+                 .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                 .build())
+        self._sp = (SoundPool.Builder()
+                    .setMaxStreams(1)
+                    .setAudioAttributes(attrs)
+                    .build())
+        self._sound_id = self._sp.load(wav_path, 1)
+
+        outer = self
+
+        class _Listener(PythonJavaClass):
+            __javainterfaces__ = ['android/media/SoundPool$OnLoadCompleteListener']
+            __javacontext__ = 'app'
+
+            @java_method('(Landroid/media/SoundPool;II)V')
+            def onLoadComplete(self, soundpool, sample_id, status):
+                if status == 0:
+                    outer._loaded = True
+
+        self._listener = _Listener()
+        self._sp.setOnLoadCompleteListener(self._listener)
+
+    def play(self):
+        if self._sp is not None:
+            if self._stream_id:
+                return  # 已经在播
+            if self._loaded:
+                # play(soundID, leftVol, rightVol, priority, loop=-1 永久循环, rate)
+                self._stream_id = self._sp.play(self._sound_id, 1.0, 1.0, 1, -1, 1.0)
+            return
+        if self._kivy_sound is not None:
+            try:
+                if self._kivy_sound.state != "play":
+                    self._kivy_sound.play()
+            except Exception:
+                pass
+
+    def stop(self):
+        if self._sp is not None:
+            if self._stream_id:
+                try:
+                    self._sp.stop(self._stream_id)
+                except Exception:
+                    pass
+                self._stream_id = 0
+            return
+        if self._kivy_sound is not None:
+            try:
+                self._kivy_sound.stop()
+            except Exception:
+                pass
 
 
 class HourglassWidget(Widget):
@@ -91,11 +207,8 @@ class HourglassWidget(Widget):
         self.particle_acc = 0.0
 
         self.sound_on = True
-        self._sound = None
         try:
-            self._sound = SoundLoader.load(resource_path(WAV_FILENAME))
-            if self._sound is not None:
-                self._sound.loop = True
+            self._sound = _SoundProxy(resource_path(WAV_FILENAME))
         except Exception:
             self._sound = None
 
@@ -176,21 +289,12 @@ class HourglassWidget(Widget):
         return self.sound_on
 
     def _play_sound(self):
-        if self._sound is None:
-            return
-        try:
-            if self._sound.state != "play":
-                self._sound.play()
-        except Exception:
-            pass
+        if self._sound is not None:
+            self._sound.play()
 
     def _stop_sound(self):
-        if self._sound is None:
-            return
-        try:
+        if self._sound is not None:
             self._sound.stop()
-        except Exception:
-            pass
 
     # ---------- tick / 粒子 ----------
     def tick(self, _dt_kivy):
@@ -328,16 +432,17 @@ class HourglassApp(App):
                          height=dp(44), spacing=dp(6))
         top1.add_widget(Label(text="周期(秒):", size_hint=(None, 1), width=dp(70),
                               color=(0.2, 0.2, 0.2, 1), font_size=sp(14)))
-        self.duration_input = TextInput(text="60", multiline=False,
-                                        size_hint=(None, 1), width=dp(80),
-                                        font_size=sp(16), input_filter="float")
+        self.duration_input = CenterTextInput(text="60", multiline=False,
+                                              size_hint=(None, 1), width=dp(90),
+                                              font_size=sp(22),
+                                              input_filter="float")
         self.duration_input.bind(on_text_validate=self._on_set_duration)
         top1.add_widget(self.duration_input)
         set_btn = Button(text="设置", size_hint=(None, 1), width=dp(60), font_size=sp(14))
         set_btn.bind(on_press=self._on_set_duration)
         top1.add_widget(set_btn)
         top1.add_widget(Widget())  # spacer
-        self.sound_btn = Button(text="音效:开", size_hint=(None, 1), width=dp(90), font_size=sp(14))
+        self.sound_btn = Button(text="音效已开", size_hint=(None, 1), width=dp(100), font_size=sp(14))
         self.sound_btn.bind(on_press=self._on_toggle_sound)
         top1.add_widget(self.sound_btn)
         root.add_widget(top1)
@@ -399,7 +504,7 @@ class HourglassApp(App):
 
     def _on_toggle_sound(self, *_):
         on = self.hourglass.toggle_sound()
-        self.sound_btn.text = "音效:开" if on else "音效:关"
+        self.sound_btn.text = "音效已开" if on else "音效已关"
 
     def _on_color(self, base, dark, light, name):
         self.hourglass.set_sand_color(base, dark, light)

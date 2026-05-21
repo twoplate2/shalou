@@ -1,7 +1,7 @@
 [app]
 
 # 启动器中显示的可见名称
-title = 沙漏
+title = 跳跳的沙漏
 
 # 内部包名(小写,无空格,无中文)
 package.name = hourglass
@@ -13,7 +13,7 @@ source.include_patterns = sand_loop.wav,fonts/*.otf
 
 version = 0.1.0
 
-requirements = python3,kivy==2.3.0
+requirements = python3,kivy==2.3.0,pyjnius
 
 # 锁定 python-for-android 到 2024 年的 tag,绕开新版默认下载 Python 3.14 alpha 的问题
 p4a.branch = v2024.01.21
