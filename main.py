@@ -54,8 +54,8 @@ GLASS_SHADOW = (0.78, 0.83, 0.85, 1.0)
 WOOD_FILL = "#8b6f47"
 WOOD_GRAIN = (0.435, 0.349, 0.22, 1.0)
 
-# 3D 锥模型: 体积 ∝ 高度³ → 高度 ∝ 体积^(1/3)
-# 上沙因子 1.0 (满仓), 下沙因子 0.9 (99.9% 模型: 同样体积下沙高度 = 上沙的 90%)
+# 上沙线性下降 (容器是截顶锥, 纯立方根会让前期下降不明显)
+# 下沙立方根 + 0.9 因子 (3600s 时 fallen=0.001 → 高度 9% 立刻可见, 留 10% 空气)
 UPPER_SAND_FACTOR = 1.0
 LOWER_SAND_FACTOR = 0.9
 WAV_FILENAME = "sand_loop.wav"
@@ -114,14 +114,34 @@ class CenterTextInput(TextInput):
 
 
 class _SoundProxy:
+    """音频抽象层。
+
+    Android 走 SoundPool。短 wav 用 SoundPool.play(loop=-1) 在部分机型有
+    ~10-30ms gap (loop 重启的硬件 buffer 缝隙) + wav 边界 click。
+    解决:用 2 个并发 stream,错开 wav_duration - fade_overlap 交替播放,
+    重叠 100ms 用 setVolume 做 equal-power crossfade,把 wav boundary
+    完全藏在 fade 区间内。
+
+    其他平台 (桌面预览) fallback 到 SoundLoader.loop=True。
+    """
+
+    _WAV_DURATION = 15.0      # 与 tools/generate_sand_loop.py DURATION 同步
+    _FADE_OVERLAP = 0.1       # 100ms 交叉重叠
+    _FADE_STEPS = 10          # fade 分 10 帧渐变
+
     def __init__(self, wav_path):
         self._is_android = (platform == "android")
         self._sp = None
         self._sound_id = None
-        self._stream_id = 0
         self._loaded = False
         self._listener = None
         self._kivy_sound = None
+
+        # 双 stream 交替状态
+        self._active = False
+        self._current_stream = 0
+        self._swap_event = None
+        self._fade_events = []
 
         if self._is_android:
             try:
@@ -148,7 +168,7 @@ class _SoundProxy:
                  .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                  .build())
         self._sp = (SoundPool.Builder()
-                    .setMaxStreams(1)
+                    .setMaxStreams(2)
                     .setAudioAttributes(attrs)
                     .build())
         self._sound_id = self._sp.load(wav_path, 1)
@@ -169,10 +189,14 @@ class _SoundProxy:
 
     def play(self):
         if self._sp is not None:
-            if self._stream_id:
+            if self._active or not self._loaded:
                 return
-            if self._loaded:
-                self._stream_id = self._sp.play(self._sound_id, 1.0, 1.0, 1, -1, 1.0)
+            self._active = True
+            # 主 stream 用 loop=0 单次播放,不让单 stream 自己 loop click
+            self._current_stream = self._sp.play(
+                self._sound_id, 1.0, 1.0, 1, 0, 1.0)
+            self._swap_event = Clock.schedule_once(
+                self._swap, self._WAV_DURATION - self._FADE_OVERLAP)
             return
         if self._kivy_sound is not None:
             try:
@@ -181,14 +205,67 @@ class _SoundProxy:
             except Exception:
                 pass
 
+    def _swap(self, _dt):
+        if not self._active or self._sp is None:
+            return
+        # 启动新 stream 在 vol=0
+        new_stream = self._sp.play(self._sound_id, 0.0, 0.0, 1, 0, 1.0)
+        old_stream = self._current_stream
+        # 100ms 内分 _FADE_STEPS 步 equal-power crossfade
+        for k in range(1, self._FADE_STEPS + 1):
+            t = k / self._FADE_STEPS
+            old_vol = math.cos(t * math.pi / 2)
+            new_vol = math.sin(t * math.pi / 2)
+            ev = Clock.schedule_once(
+                lambda _dt, o=old_stream, n=new_stream, ov=old_vol, nv=new_vol:
+                    self._apply_volumes(o, n, ov, nv),
+                self._FADE_OVERLAP * t)
+            self._fade_events.append(ev)
+        # fade 结束后停止 old stream
+        ev = Clock.schedule_once(
+            lambda _dt, sid=old_stream: self._safe_stop(sid),
+            self._FADE_OVERLAP + 0.01)
+        self._fade_events.append(ev)
+        # 切换 current,排下一次 swap
+        self._current_stream = new_stream
+        self._swap_event = Clock.schedule_once(
+            self._swap, self._WAV_DURATION - self._FADE_OVERLAP)
+
+    def _apply_volumes(self, old_id, new_id, old_vol, new_vol):
+        if not self._active or self._sp is None:
+            return
+        try:
+            self._sp.setVolume(old_id, old_vol, old_vol)
+            self._sp.setVolume(new_id, new_vol, new_vol)
+        except Exception:
+            pass
+
+    def _safe_stop(self, stream_id):
+        if self._sp is None or not stream_id:
+            return
+        try:
+            self._sp.stop(stream_id)
+        except Exception:
+            pass
+
     def stop(self):
         if self._sp is not None:
-            if self._stream_id:
+            self._active = False
+            if self._swap_event is not None:
                 try:
-                    self._sp.stop(self._stream_id)
+                    self._swap_event.cancel()
                 except Exception:
                     pass
-                self._stream_id = 0
+                self._swap_event = None
+            for ev in self._fade_events:
+                try:
+                    ev.cancel()
+                except Exception:
+                    pass
+            self._fade_events = []
+            if self._current_stream:
+                self._safe_stop(self._current_stream)
+                self._current_stream = 0
             return
         if self._kivy_sound is not None:
             try:
@@ -653,11 +730,11 @@ class HourglassWidget(Widget):
     def _draw_top_sand(self, cx, top_y, neck_y, bot_y, top_w, neck_w,
                        remaining, fallen):
         """画上沙体 Mesh + 侧壁描边 + 层理 + 装饰颗粒"""
-        sand_top_y = neck_y + (top_y - neck_y) * (remaining ** (1.0 / 3.0)) * UPPER_SAND_FACTOR
+        sand_top_y = neck_y + (top_y - neck_y) * remaining * UPPER_SAND_FACTOR
         w_at_top = self._w_at_y(sand_top_y, top_y, neck_y, bot_y, top_w, neck_w)
 
         # 漏斗坑深度,clip 到不能伸进颈部下方
-        dip_depth = (fallen ** (1.0 / 3.0)) * 16
+        dip_depth = max(0.0, fallen - 0.05) * 14
         dip_depth = min(dip_depth, max(0.0, sand_top_y - neck_y - 2))
 
         n = CURVE_STEPS
@@ -716,7 +793,7 @@ class HourglassWidget(Widget):
         w_at_top = self._w_at_y(mound_top_y, top_y, neck_y, bot_y, top_w, neck_w)
 
         # 中央堆尖,clip 到不能高过颈部
-        peak_height = (fallen ** (1.0 / 3.0)) * 12
+        peak_height = max(0.0, fallen - 0.10) * 10
         peak_height = min(peak_height, max(0.0, neck_y - mound_top_y - 2))
 
         peak_center = 0.5 + max(-0.2, min(0.2, self.mound_peak_offset / max(1.0, w_at_top * 2)))

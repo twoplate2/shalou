@@ -5,14 +5,14 @@
 - 22050Hz mono 16-bit (体积小,SoundPool 1MB 上限内)
 - 高通过滤白噪声 y[i] = x[i] - 0.7*x[i-1] (沙沙感)
 - 15 秒长度 (减少边界出现频次)
-- 1 秒 crossfade overlap-add (确保边界处样本是自然连续的)
+- 1 秒 equal-power crossfade (cos²+sin²=1, 能量恒定)
 
-为什么 crossfade 比 "filter wrap" 更好:
-旧版本只让滤波器状态在 i=0 时取 whites[-1] 来保持连续,但白噪声序列本身在
-boundary 是离散跳变 (whites[n-1] 跟 whites[0] 完全无关),量化到 int16 会
-产生微小但可听的 click。crossfade 让 sample[0] = filtered[n] (噪声序列
-的自然延续),sample[crossfade-1] 平滑过渡到 filtered[crossfade-1]。
+为什么用 equal-power 不用 linear:
+linear fade 在 t=0.5 处 a²+b² = 0.5²+0.5² = 0.5,叠加后 rms 降到 0.707σ (-3dB),
+听起来 fade 区间能量"凹陷"。equal-power 用 cos/sin: 任意 t 处 cos²(tπ/2)+sin²(tπ/2) = 1,
+两个独立信号叠加后 rms 恒等 σ,听不出 fade 边界。
 """
+import math
 import os
 import random
 import struct
@@ -37,12 +37,14 @@ def generate(path, duration=DURATION, crossfade_sec=CROSSFADE_SEC):
     for i in range(1, n_extended):
         filtered[i] = whites[i] - 0.7 * whites[i - 1]
 
-    # overlap-add: 把 [n..n+crossfade-1] 渐变叠到 [0..crossfade-1] 上
-    # 让 sample[0] = filtered[n] (loop 边界的自然延续),sample[crossfade-1] ≈ filtered[crossfade-1]
+    # equal-power overlap-add: 让 sample[0] = filtered[n] (loop 边界的自然延续),
+    # sample[crossfade-1] ≈ filtered[crossfade-1]
     samples = list(filtered[:n])
     for i in range(crossfade):
-        t = i / crossfade  # 0 → 1
-        samples[i] = filtered[n + i] * (1 - t) + filtered[i] * t
+        t = (i + 0.5) / crossfade  # 0 → 1
+        a = math.cos(t * math.pi / 2)  # fade-out tail (filtered[n+i])
+        b = math.sin(t * math.pi / 2)  # fade-in head (filtered[i])
+        samples[i] = filtered[n + i] * a + filtered[i] * b
 
     with wave.open(path, "wb") as wf:
         wf.setnchannels(1)
