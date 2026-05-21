@@ -169,6 +169,7 @@ __pycache__/
    git commit -m "Initial commit"
    ```
 3. **网页建空 repo**: https://github.com/new — **不勾任何** README/.gitignore/license(否则要 merge),Public 方便下载 Artifacts
+   > ⚠️ **每个项目单独建 repo**——沙漏和计算器用的不同的仓库地址。别把新 app push 到旧项目里。
 4. **关联远端 + push**:
    ```
    git remote add origin https://github.com/<owner>/<repo>.git
