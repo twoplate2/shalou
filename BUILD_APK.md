@@ -136,6 +136,8 @@ jobs:
 
       - name: Build APK (debug)
         run: yes | buildozer android debug
+        env:
+          PYTHON3_VERSION: "3.12"   # ⚠️ 必须锁死! 见下方"Python 版本陷阱"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -184,6 +186,7 @@ __pycache__/
 
 | 错误 | 原因 | 解法 |
 |---|---|---|
+| `_PyLong_AsByteArray` too few arguments (expected 6, have 5) | python-for-android 默认下载 **Python 3.14 alpha**(2026 年起),其 C API 签名变了 | workflow Build 步骤加 `env: PYTHON3_VERSION: "3.12"`(见下文详解);同时改 buildozer.spec 任意行注释来破缓存 hash |
 | `Cython compilation failed` | Cython 3.x 不兼容 p4a | spec 锁 `pip install "cython<3.0"` |
 | `JAVA_HOME not set` | runner 没配 Java | `actions/setup-java@v5` + `java-version: '17'` |
 | `NDK download timeout` | Google CDN 偶发 | retry workflow,通常二次能过 |
@@ -192,6 +195,27 @@ __pycache__/
 | 闪屏后黑屏 | `presplash_color` ≠ app 背景 | spec 改 `android.presplash_color = #你的BG色` |
 | App 切后台回来 GL 黑屏 | 没实现生命周期 | `on_pause` 返 True, `on_resume` 重载音频/纹理 |
 | Windows 双击 .py 闪退 | tk.Frame 的 padx/pady 不接受 tuple | 把 padx/pady 移到 `pack()` 调用,或换 ttk.Frame.padding |
+
+### ⚠️ Python 版本陷阱 (2026 年新增)
+
+python-for-android 现在**默认下载 Python 3.14 alpha**（2026 年 3.14 已进入开发期）。Python 3.14 修改了 C API:
+
+```
+// Python 3.13 及之前 — 5 个参数
+int _PyLong_AsByteArray(PyLongObject* v, unsigned char* bytes, size_t n,
+                        int little_endian, int is_signed);
+
+// Python 3.14 — 6 个参数（新增 is_unsigned）
+int _PyLong_AsByteArray(PyLongObject* v, unsigned char* bytes, size_t n,
+                        int little_endian, int is_signed, int is_unsigned);
+```
+
+Kivy 2.3.0 的 Cython 生成代码（`kivy/graphics/compiler.c`）调用旧版 5 参数签名 → 编译报错:
+```
+error: too few arguments to function call, expected 6, have 5
+```
+
+**唯一解法**: workflow Build 步骤设置 `env: PYTHON3_VERSION: "3.12"` 强制 python-for-android 下载 Python 3.12。同时需要修改 `buildozer.spec` 任意行注释来破坏 GitHub Actions 缓存 hash（否则会复用上次失败的 Python 3.14 build）。
 
 ---
 
