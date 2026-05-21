@@ -1,7 +1,9 @@
 """
-沙漏 - Android Kivy 版本 (MVP)
-保留:外形/上下沙体/粒子流量守恒/计时/6 色块/音效循环
-简化:无装饰颗粒/无玻璃高光木纹/无 flares/无底部喇叭/无 EMA 沙堆顶
+沙漏 - Android Kivy 版本(精美化升级)
+
+视觉层包含:沙顶曲线 + 漏斗坑、装饰颗粒、沙堆中央堆尖、玻璃高光、
+木盖横纹、渐变粒子色、底部喇叭口、触底反弹/闪光、沙堆塌陷、完成尘埃、
+水平层理、暂停遮罩、颈部涌出沙柱。
 """
 import math
 import os
@@ -10,10 +12,9 @@ import time
 
 from kivy.app import App
 from kivy.clock import Clock
-from kivy.core.audio import SoundLoader
 from kivy.core.text import LabelBase, Label as CoreLabel
 from kivy.core.window import Window
-from kivy.graphics import Color, Rectangle, Line, Quad
+from kivy.graphics import Color, Rectangle, Line, Quad, Mesh
 from kivy.metrics import dp, sp
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
@@ -23,8 +24,6 @@ from kivy.uix.widget import Widget
 from kivy.utils import platform
 
 
-# 注册中文字体并覆盖 Kivy 默认 "Roboto" 名,使所有 Label/Button 自动渲染汉字
-# Android 系统不带中文字体,不注册的话所有汉字会显示为豆腐块
 _FONT_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "fonts",
@@ -50,16 +49,33 @@ SAND_PRESETS = [
 ]
 BG_COLOR = "#fdf6e3"
 GLASS_FILL = "#eaf3f8"
+GLASS_HIGHLIGHT = (0.97, 0.98, 0.99, 1.0)
+GLASS_SHADOW = (0.78, 0.83, 0.85, 1.0)
 WOOD_FILL = "#8b6f47"
+WOOD_GRAIN = (0.435, 0.349, 0.22, 1.0)
 
-MOUND_MAX_FILL = 1.0
+SAND_FILL_RATIO = 0.80  # 上下沙体最大填充比 (留 20% 的余量,避免顶/底贴满显假)
 WAV_FILENAME = "sand_loop.wav"
+
+CURVE_STEPS = 16
+TOP_DECOR_COUNT = 35
+MOUND_DECOR_COUNT = 50
+COLLAPSE_INTERVAL = (2.5, 4.0)
+COLLAPSE_DURATION = 0.6
+DUST_COUNT = 25
+DUST_LIFETIME = 1.0
 
 
 def hex_rgb(h):
     return (int(h[1:3], 16) / 255.0,
             int(h[3:5], 16) / 255.0,
             int(h[5:7], 16) / 255.0)
+
+
+def lerp_rgb(c1, c2, t):
+    return (c1[0] + (c2[0] - c1[0]) * t,
+            c1[1] + (c2[1] - c1[1]) * t,
+            c1[2] + (c2[2] - c1[2]) * t)
 
 
 def resource_path(name):
@@ -73,8 +89,6 @@ def fg_for(hex_color):
 
 
 class CenterTextInput(TextInput):
-    """让 TextInput 文字水平+垂直居中(Kivy 原生 TextInput 默认左对齐顶对齐,无 align 属性)"""
-
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.bind(text=self._refresh_pad,
@@ -97,20 +111,13 @@ class CenterTextInput(TextInput):
 
 
 class _SoundProxy:
-    """统一音效接口:Android 用 SoundPool 实现无 gap 循环,桌面 fallback 到 Kivy SoundLoader.
-
-    Android 默认 SoundLoader 底层走 Java MediaPlayer.setLooping(True),循环短音频每次切换
-    有 50-100ms 静音 gap → 用户听到沙沙声断续。SoundPool 是 Android 官方为短音效设计的
-    API,内存预解码 + 硬件循环,做到无缝重复。
-    """
-
     def __init__(self, wav_path):
         self._is_android = (platform == "android")
         self._sp = None
         self._sound_id = None
         self._stream_id = 0
         self._loaded = False
-        self._listener = None  # 防 PythonJavaClass 被 GC
+        self._listener = None
         self._kivy_sound = None
 
         if self._is_android:
@@ -118,7 +125,7 @@ class _SoundProxy:
                 self._init_soundpool(wav_path)
                 return
             except Exception:
-                self._sp = None  # 任何失败 → fallback
+                self._sp = None
 
         try:
             from kivy.core.audio import SoundLoader
@@ -160,9 +167,8 @@ class _SoundProxy:
     def play(self):
         if self._sp is not None:
             if self._stream_id:
-                return  # 已经在播
+                return
             if self._loaded:
-                # play(soundID, leftVol, rightVol, priority, loop=-1 永久循环, rate)
                 self._stream_id = self._sp.play(self._sound_id, 1.0, 1.0, 1, -1, 1.0)
             return
         if self._kivy_sound is not None:
@@ -202,9 +208,22 @@ class HourglassWidget(Widget):
         self.sand_base = hex_rgb(SAND_BASE)
         self.sand_dark = hex_rgb(SAND_DARK)
         self.sand_light = hex_rgb(SAND_LIGHT)
+        self._color_table = []
+        self._rebuild_color_table()
 
         self.particles = []
         self.particle_acc = 0.0
+
+        self.splashes = []
+        self.flares = []
+        self.dusts = []
+
+        self.mound_peak_offset = 0.0
+
+        self._collapse = None
+        self._next_collapse = time.time() + random.uniform(*COLLAPSE_INTERVAL)
+
+        self._completion_triggered = False
 
         self.sound_on = True
         try:
@@ -212,7 +231,32 @@ class HourglassWidget(Widget):
         except Exception:
             self._sound = None
 
+        self._gen_static_decor()
         Clock.schedule_interval(self.tick, 1 / 60)
+
+    def _rebuild_color_table(self):
+        self._color_table = [
+            lerp_rgb(self.sand_base, self.sand_light, i / 10.0)
+            for i in range(11)
+        ]
+
+    def _gen_static_decor(self):
+        rng = random.Random(7)
+        self.top_surface = [
+            (rng.random(), rng.uniform(-1.5, 1.5), rng.uniform(0.8, 3.5),
+             rng.random() < 0.5)
+            for _ in range(TOP_DECOR_COUNT)
+        ]
+        rng = random.Random(13)
+        self.mound_surface = [
+            (rng.random(), rng.uniform(-1.5, 1.5), rng.uniform(0.5, 3.0),
+             rng.random() >= 0.6)
+            for _ in range(MOUND_DECOR_COUNT)
+        ]
+        rng = random.Random(23)
+        self.top_curve_noise = [rng.uniform(-1.2, 1.0) for _ in range(CURVE_STEPS + 1)]
+        rng = random.Random(31)
+        self.mound_curve_noise = [rng.uniform(-1.0, 1.5) for _ in range(CURVE_STEPS + 1)]
 
     # ---------- 几何 ----------
     def get_geom(self):
@@ -239,8 +283,17 @@ class HourglassWidget(Widget):
         fallen = 1 - self.get_remaining()
         if fallen <= 0.001:
             return g["bot_y"]
-        sand_h = (g["neck_y"] - g["bot_y"]) * fallen * MOUND_MAX_FILL
+        sand_h = (g["neck_y"] - g["bot_y"]) * fallen * SAND_FILL_RATIO
         return g["bot_y"] + sand_h
+
+    def _w_at_y(self, y, glass_top, neck_y, bot_y, top_w, neck_w):
+        """玻璃在 y 处的横向半宽"""
+        if y >= neck_y:
+            t = (y - neck_y) / max(1e-3, glass_top - neck_y)
+        else:
+            t = 1 - (y - bot_y) / max(1e-3, neck_y - bot_y)
+        t = max(0.0, min(1.0, t))
+        return neck_w + (top_w - neck_w) * t
 
     # ---------- 控制 ----------
     def toggle(self):
@@ -251,6 +304,11 @@ class HourglassWidget(Widget):
             if self.elapsed >= self.duration:
                 self.elapsed = 0
                 self.particles = []
+                self.splashes = []
+                self.flares = []
+                self.dusts = []
+                self.mound_peak_offset = 0.0
+                self._completion_triggered = False
             self.running = True
             self.last_tick = time.time()
             if self.sound_on:
@@ -262,6 +320,12 @@ class HourglassWidget(Widget):
         self.last_tick = None
         self.particles = []
         self.particle_acc = 0.0
+        self.splashes = []
+        self.flares = []
+        self.dusts = []
+        self.mound_peak_offset = 0.0
+        self._collapse = None
+        self._completion_triggered = False
         self._stop_sound()
 
     def set_duration(self, d):
@@ -279,6 +343,7 @@ class HourglassWidget(Widget):
         self.sand_base = hex_rgb(base)
         self.sand_dark = hex_rgb(dark)
         self.sand_light = hex_rgb(light)
+        self._rebuild_color_table()
 
     def toggle_sound(self):
         self.sound_on = not self.sound_on
@@ -296,7 +361,7 @@ class HourglassWidget(Widget):
         if self._sound is not None:
             self._sound.stop()
 
-    # ---------- tick / 粒子 ----------
+    # ---------- tick / 物理 ----------
     def tick(self, _dt_kivy):
         now = time.time()
         dt = min(0.05, now - self.last_frame)
@@ -309,6 +374,10 @@ class HourglassWidget(Widget):
                 self.elapsed = self.duration
                 self.running = False
                 self._stop_sound()
+                if not self._completion_triggered:
+                    self._spawn_dust()
+                    self._completion_triggered = True
+        self.update_collapse(now)
         self.update_particles(dt)
         self.redraw()
         app = App.get_running_app()
@@ -316,45 +385,161 @@ class HourglassWidget(Widget):
             app.update_time(max(0.0, self.duration - self.elapsed), self.duration,
                             running=self.running)
 
-    def update_particles(self, dt):
+    def update_collapse(self, now):
+        if self._collapse is not None:
+            if now >= self._collapse["end"]:
+                self._collapse = None
+                self._next_collapse = now + random.uniform(*COLLAPSE_INTERVAL)
+        elif self.running:
+            rem = self.get_remaining()
+            if 0.05 < rem < 0.95 and now >= self._next_collapse:
+                self._collapse = {
+                    "tt": random.uniform(0.25, 0.75),
+                    "magnitude": random.uniform(1.2, 2.4),
+                    "start": now,
+                    "end": now + COLLAPSE_DURATION,
+                }
+
+    def _collapse_y_offset(self, tt, now=None):
+        """对 mound 表面颗粒/曲线求当前塌陷下沉量(Kivy y 向上,负值=向下沉)"""
+        if self._collapse is None:
+            return 0.0
+        c = self._collapse
+        if abs(tt - c["tt"]) > 0.18:
+            return 0.0
+        if now is None:
+            now = time.time()
+        progress = (now - c["start"]) / COLLAPSE_DURATION
+        if progress < 0 or progress > 1:
+            return 0.0
+        # 0..0.18 快速下沉,0.18..1 慢慢恢复(被新沙补满)
+        if progress < 0.18:
+            factor = progress / 0.18
+        else:
+            factor = 1 - ((progress - 0.18) / 0.82) ** 0.6
+        falloff = 1 - (abs(tt - c["tt"]) / 0.18) ** 2
+        return -c["magnitude"] * factor * falloff
+
+    def _spawn_dust(self):
         g = self.get_geom()
         mound_top = self.get_mound_top_y()
-        remaining = self.get_remaining()
+        cx = g["cx"]
+        w_at_top = self._w_at_y(mound_top, g["top_y"], g["neck_y"], g["bot_y"],
+                                g["top_w"], g["neck_w"])
+        now = time.time()
+        for _ in range(DUST_COUNT):
+            self.dusts.append({
+                "x": cx + random.uniform(-w_at_top * 0.7, w_at_top * 0.7),
+                "y": mound_top + random.uniform(0, 5),
+                "vx": random.uniform(-25, 25),
+                "vy": random.uniform(20, 60),
+                "end": now + DUST_LIFETIME,
+            })
 
-        # Kivy y 向上,粒子从颈部 y=neck_y 向下(y 减小)
+    def update_particles(self, dt):
+        g = self.get_geom()
+        cx = g["cx"]
+        mound_top = self.get_mound_top_y()
+        remaining = self.get_remaining()
+        now = time.time()
+
+        # 主流粒子生成 — 横向均匀分布(填满颈部缝隙)
         if self.running and remaining > 0:
             speed_factor = max(0.5, min(2.5, 60.0 / self.duration))
-            rate = 250 * speed_factor
+            rate = 200 * speed_factor
             if remaining < 0.08:
                 rate *= max(0.1, (remaining / 0.08) ** 0.5)
             self.particle_acc += dt * rate
-            sigma = max(1.0, g["neck_w"] * 0.5)
-            x_clip = g["neck_w"] - 1
+            x_clip = max(1.0, g["neck_w"] - 1)
             while self.particle_acc >= 1:
                 self.particle_acc -= 1
-                x_off = random.gauss(0, sigma)
-                x_off = max(-x_clip, min(x_clip, x_off))
+                x_off = random.uniform(-x_clip, x_clip)  # 均匀,不再高斯
                 self.particles.append({
-                    "x": g["cx"] + x_off,
+                    "x": cx + x_off,
                     "x_offset": x_off,
-                    "y": g["neck_y"] - random.uniform(0, 1.5),
-                    "vy": -random.uniform(40, 65),
+                    "y": g["neck_y"] + random.uniform(-2, 1),  # 起点在颈部内
+                    "vy": -random.uniform(60, 90),
+                    "is_light": random.random() < 0.10,
+                    "size": 2 if random.random() < 0.85 else 1,
                 })
 
+        # 主流粒子物理
         gforce = -700.0
-        v0_abs = 50.0
+        v0_abs = 75.0
         new_list = []
         for p in self.particles:
             p["vy"] += gforce * dt
             p["y"] += p["vy"] * dt
-            fallen = max(0.0, g["neck_y"] - p["y"])
-            v_at = (v0_abs ** 2 + 2 * 700.0 * fallen) ** 0.5
-            shrink = max(0.12, (v0_abs / v_at) ** 0.5)
-            p["x"] = g["cx"] + p["x_offset"] * shrink
+
+            fallen_dist = max(0.0, g["neck_y"] - p["y"])
+            if fallen_dist < 6:
+                shrink = 1.0  # 颈部下方 6px 内保持原宽
+            else:
+                eff_fallen = fallen_dist - 6
+                v_at = (v0_abs ** 2 + 2 * 700.0 * eff_fallen) ** 0.5
+                shrink = max(0.12, (v0_abs / v_at) ** 0.5)
+                # 底部喇叭口
+                dist_to_floor = p["y"] - mound_top
+                if 0 < dist_to_floor < 30:
+                    shrink *= 1 + (1 - dist_to_floor / 30) * 0.4
+
+            p["x"] = cx + p["x_offset"] * shrink
+
             if p["y"] <= mound_top + 1:
+                # EMA 更新中央堆尖
+                if mound_top > g["bot_y"] + 1:
+                    self.mound_peak_offset = (
+                        self.mound_peak_offset * 0.97 + (p["x"] - cx) * 0.03
+                    )
+                if random.random() < 0.25:
+                    self.flares.append({
+                        "x": p["x"],
+                        "y": mound_top,
+                        "end": now + 0.08,
+                    })
+                if random.random() < 0.50:
+                    self.splashes.append({
+                        "x": p["x"],
+                        "y": mound_top,
+                        "vx": random.uniform(-35, 35),
+                        "vy": random.uniform(55, 110),
+                    })
                 continue
             new_list.append(p)
         self.particles = new_list
+
+        # splash 物理
+        new_splashes = []
+        for s in self.splashes:
+            s["vy"] += gforce * dt
+            s["y"] += s["vy"] * dt
+            s["x"] += s["vx"] * dt
+            half_w = self._w_at_y(s["y"], g["top_y"], g["neck_y"], g["bot_y"],
+                                  g["top_w"], g["neck_w"])
+            if abs(s["x"] - cx) > half_w - 1:
+                continue
+            if s["vy"] < 0 and s["y"] <= mound_top + 1:
+                continue
+            if s["y"] < g["bot_y"] or s["y"] > g["neck_y"] - 5:
+                continue
+            new_splashes.append(s)
+        self.splashes = new_splashes
+
+        # flares 过期
+        self.flares = [f for f in self.flares if f["end"] > now]
+
+        # dust 物理
+        new_dusts = []
+        for d in self.dusts:
+            d["vy"] += gforce * dt
+            d["y"] += d["vy"] * dt
+            d["x"] += d["vx"] * dt
+            if now > d["end"]:
+                continue
+            if d["y"] < mound_top - 1:
+                continue
+            new_dusts.append(d)
+        self.dusts = new_dusts
 
     # ---------- 渲染 ----------
     def redraw(self):
@@ -363,53 +548,227 @@ class HourglassWidget(Widget):
         cx = g["cx"]
         top_y, neck_y, bot_y = g["top_y"], g["neck_y"], g["bot_y"]
         top_w, neck_w, cap_h = g["top_w"], g["neck_w"], g["cap_h"]
+        remaining = self.get_remaining()
+        fallen = 1 - remaining
+        mound_top_base = bot_y + (neck_y - bot_y) * fallen * SAND_FILL_RATIO
+        now = time.time()
 
         with self.canvas:
-            # 玻璃填充(上半倒梯 + 下半正梯)
+            # 1. 玻璃填充
             Color(*hex_rgb(GLASS_FILL))
             Quad(points=[cx - top_w, top_y, cx + top_w, top_y,
                          cx + neck_w, neck_y, cx - neck_w, neck_y])
             Quad(points=[cx - neck_w, neck_y, cx + neck_w, neck_y,
                          cx + top_w, bot_y, cx - top_w, bot_y])
 
-            # 玻璃描边
-            Color(0.4, 0.4, 0.4, 1)
-            Line(points=[cx - top_w, top_y, cx + top_w, top_y, cx + neck_w, neck_y,
-                         cx + top_w, bot_y, cx - top_w, bot_y, cx - neck_w, neck_y,
-                         cx - top_w, top_y], width=1.2)
+            # 2. 玻璃左壁高光 + 右壁阴影
+            Color(*GLASS_HIGHLIGHT)
+            Line(points=[cx - top_w + 4, top_y - 4,
+                         cx - neck_w + 3, neck_y + 2], width=1.5)
+            Line(points=[cx - neck_w + 3, neck_y - 2,
+                         cx - top_w + 4, bot_y + 4], width=1.5)
+            Color(*GLASS_SHADOW)
+            Line(points=[cx + top_w - 4, top_y - 4,
+                         cx + neck_w - 3, neck_y + 2], width=1.0)
+            Line(points=[cx + neck_w - 3, neck_y - 2,
+                         cx + top_w - 4, bot_y + 4], width=1.0)
 
-            # 上沙体(沙顶随 remaining 从 top_y 向 neck_y 下降)
-            remaining = self.get_remaining()
+            # 3. 上沙体
             if remaining > 0.001:
-                sand_top_y = neck_y + (top_y - neck_y) * remaining
-                t = (top_y - sand_top_y) / max(1.0, top_y - neck_y)
-                w = top_w * (1 - t) + neck_w * t
-                Color(*self.sand_base)
-                Quad(points=[cx - w, sand_top_y, cx + w, sand_top_y,
-                             cx + neck_w, neck_y, cx - neck_w, neck_y])
+                self._draw_top_sand(cx, top_y, neck_y, bot_y, top_w, neck_w,
+                                    remaining, fallen)
 
-            # 下沙堆(底部 top_w,顶部 w2 收窄到 neck_w 方向)
-            fallen = 1 - remaining
+            # 4. 下沙堆
             if fallen > 0.001:
-                sand_h_lo = (neck_y - bot_y) * fallen * MOUND_MAX_FILL
-                sand_top_y2 = bot_y + sand_h_lo
-                tt = (sand_top_y2 - bot_y) / max(1.0, neck_y - bot_y)
-                w2 = top_w * (1 - tt) + neck_w * tt
-                Color(*self.sand_base)
-                Quad(points=[cx - top_w, bot_y, cx + top_w, bot_y,
-                             cx + w2, sand_top_y2, cx - w2, sand_top_y2])
+                self._draw_mound_sand(cx, top_y, neck_y, bot_y, top_w, neck_w,
+                                      mound_top_base, fallen)
 
-            # 木盖
+            # 5. 颈部涌出沙柱
+            if remaining > 0.001 and self.running:
+                Color(*self.sand_base)
+                spout_h = 5
+                Rectangle(pos=(cx - neck_w, neck_y - spout_h),
+                          size=(2 * neck_w, spout_h))
+
+            # 6. 木盖 + 横纹
             Color(*hex_rgb(WOOD_FILL))
             cap_w = top_w + dp(8)
             Rectangle(pos=(cx - cap_w, top_y), size=(2 * cap_w, cap_h))
             Rectangle(pos=(cx - cap_w, bot_y - cap_h), size=(2 * cap_w, cap_h))
+            Color(*WOOD_GRAIN)
+            for cap_base_y in (top_y, bot_y - cap_h):
+                Line(points=[cx - cap_w, cap_base_y + cap_h * 0.32,
+                             cx + cap_w, cap_base_y + cap_h * 0.32], width=0.8)
+                Line(points=[cx - cap_w, cap_base_y + cap_h * 0.65,
+                             cx + cap_w, cap_base_y + cap_h * 0.65], width=0.8)
 
-            # 粒子(单色,Rectangle 拖尾长度 = |vy|*0.05)
-            Color(*self.sand_base)
+            # 7. 玻璃外描边
+            Color(0.4, 0.4, 0.4, 1)
+            Line(points=[cx - top_w, top_y, cx + top_w, top_y,
+                         cx + neck_w, neck_y, cx + top_w, bot_y,
+                         cx - top_w, bot_y, cx - neck_w, neck_y,
+                         cx - top_w, top_y], width=1.2)
+
+            # 8. 沙流粒子
             for p in self.particles:
+                if p["is_light"]:
+                    Color(*self.sand_light)
+                else:
+                    h_total = max(1.0, neck_y - bot_y)
+                    idx = int((neck_y - p["y"]) / h_total * 10)
+                    idx = max(0, min(10, idx))
+                    Color(*self._color_table[idx])
                 trail = max(2.0, abs(p["vy"]) * 0.05)
-                Rectangle(pos=(p["x"] - 1, p["y"]), size=(2, trail))
+                Rectangle(pos=(p["x"] - p["size"] / 2, p["y"]),
+                          size=(p["size"], trail))
+
+            # 9. splash 粒子
+            Color(*self.sand_light)
+            for s in self.splashes:
+                Rectangle(pos=(s["x"] - 0.75, s["y"] - 0.75),
+                          size=(1.5, 1.5))
+
+            # 10. flares 半透明闪光
+            for f in self.flares:
+                rem_life = max(0.0, f["end"] - now) / 0.08
+                Color(self.sand_light[0], self.sand_light[1],
+                      self.sand_light[2], 0.45 * rem_life)
+                size = 4 + rem_life * 2
+                Rectangle(pos=(f["x"] - size / 2, f["y"] - size / 2),
+                          size=(size, size))
+
+            # 11. 完成尘埃
+            Color(*self.sand_light)
+            for d in self.dusts:
+                Rectangle(pos=(d["x"], d["y"]), size=(1, 1))
+
+            # 12. 暂停遮罩
+            if not self.running and 0 < self.elapsed < self.duration:
+                Color(0.99, 0.96, 0.89, 0.55)
+                Rectangle(pos=self.pos, size=self.size)
+
+    def _draw_top_sand(self, cx, top_y, neck_y, bot_y, top_w, neck_w,
+                       remaining, fallen):
+        """画上沙体 Mesh + 侧壁描边 + 层理 + 装饰颗粒"""
+        sand_top_y = neck_y + (top_y - neck_y) * remaining * SAND_FILL_RATIO
+        w_at_top = self._w_at_y(sand_top_y, top_y, neck_y, bot_y, top_w, neck_w)
+
+        # 漏斗坑深度,clip 到不能伸进颈部下方
+        dip_depth = max(0.0, fallen - 0.05) * 14
+        dip_depth = min(dip_depth, max(0.0, sand_top_y - neck_y - 2))
+
+        n = CURVE_STEPS
+        verts = [cx, neck_y, 0, 0]                   # fan center
+        verts.extend([cx + neck_w, neck_y, 0, 0])    # 颈部右
+        for i in range(n + 1):                        # 沙顶从右到左
+            t = 1.0 - i / n
+            x = cx - w_at_top + 2 * w_at_top * t
+            local = 1 - 4 * (t - 0.5) ** 2
+            y = sand_top_y - dip_depth * local
+            if 0 < i < n:
+                y += self.top_curve_noise[i]
+            verts.extend([x, y, 0, 0])
+        verts.extend([cx - neck_w, neck_y, 0, 0])    # 颈部左
+
+        indices = list(range(len(verts) // 4))
+        Color(*self.sand_base)
+        Mesh(vertices=verts, indices=indices, mode='triangle_fan')
+
+        # 侧壁描边
+        Color(*self.sand_dark)
+        Line(points=[cx - w_at_top, sand_top_y,
+                     cx - neck_w, neck_y], width=1.0)
+        Line(points=[cx + w_at_top, sand_top_y,
+                     cx + neck_w, neck_y], width=1.0)
+
+        # 水平层理
+        if remaining > 0.18:
+            Color(self.sand_dark[0], self.sand_dark[1], self.sand_dark[2], 0.18)
+            band_total = sand_top_y - neck_y
+            for ratio in (0.30, 0.55, 0.78):
+                y_band = sand_top_y - band_total * ratio
+                hw = self._w_at_y(y_band, top_y, neck_y, bot_y, top_w, neck_w)
+                Line(points=[cx - hw + 2, y_band,
+                             cx + hw - 2, y_band], width=0.8)
+
+        # 装饰颗粒 (沙顶下方 1-4.5px)
+        for tt, dx, dy, is_dark in self.top_surface:
+            local = 1 - 4 * (tt - 0.5) ** 2
+            base_x = cx - w_at_top + 2 * w_at_top * tt + dx
+            base_y = sand_top_y - dip_depth * local - dy - 1
+            limit_w = w_at_top - 1
+            if abs(base_x - cx) > limit_w:
+                continue
+            if base_y < neck_y + 1 or base_y > sand_top_y - 0.5:
+                continue
+            if is_dark:
+                Color(*self.sand_dark)
+            else:
+                Color(*self.sand_light)
+            Rectangle(pos=(base_x - 0.75, base_y - 0.75), size=(1.5, 1.5))
+
+    def _draw_mound_sand(self, cx, top_y, neck_y, bot_y, top_w, neck_w,
+                         mound_top_y, fallen):
+        """画下沙堆 Mesh + 中央堆尖 + 塌陷 + 装饰颗粒"""
+        w_at_top = self._w_at_y(mound_top_y, top_y, neck_y, bot_y, top_w, neck_w)
+
+        # 中央堆尖,clip 到不能高过颈部
+        peak_height = max(0.0, fallen - 0.10) * 10
+        peak_height = min(peak_height, max(0.0, neck_y - mound_top_y - 2))
+
+        peak_center = 0.5 + max(-0.2, min(0.2, self.mound_peak_offset / max(1.0, w_at_top * 2)))
+
+        n = CURVE_STEPS
+        verts = [cx, bot_y, 0, 0]                    # fan center
+        verts.extend([cx + top_w, bot_y, 0, 0])      # 底部右
+        for i in range(n + 1):                        # 沙堆顶从右到左
+            t = 1.0 - i / n
+            x = cx - w_at_top + 2 * w_at_top * t
+            peak = max(0.0, 1 - 16 * (t - peak_center) ** 2)
+            y = mound_top_y + peak_height * peak
+            if 0 < i < n:
+                y += self.mound_curve_noise[i]
+            y += self._collapse_y_offset(t)
+            verts.extend([x, y, 0, 0])
+        verts.extend([cx - top_w, bot_y, 0, 0])      # 底部左
+
+        indices = list(range(len(verts) // 4))
+        Color(*self.sand_base)
+        Mesh(vertices=verts, indices=indices, mode='triangle_fan')
+
+        # 侧壁描边
+        Color(*self.sand_dark)
+        Line(points=[cx - w_at_top, mound_top_y,
+                     cx - top_w, bot_y], width=1.0)
+        Line(points=[cx + w_at_top, mound_top_y,
+                     cx + top_w, bot_y], width=1.0)
+
+        # 水平层理
+        if fallen > 0.18:
+            Color(self.sand_dark[0], self.sand_dark[1], self.sand_dark[2], 0.18)
+            band_total = mound_top_y - bot_y
+            for ratio in (0.25, 0.55, 0.80):
+                y_band = bot_y + band_total * ratio
+                hw = self._w_at_y(y_band, top_y, neck_y, bot_y, top_w, neck_w)
+                Line(points=[cx - hw + 2, y_band,
+                             cx + hw - 2, y_band], width=0.8)
+
+        # 装饰颗粒
+        for tt, dx, dy, is_dark in self.mound_surface:
+            peak = max(0.0, 1 - 16 * (tt - peak_center) ** 2)
+            base_x = cx - w_at_top + 2 * w_at_top * tt + dx
+            base_y = mound_top_y + peak_height * peak - dy - 1
+            base_y += self._collapse_y_offset(tt)
+            limit_w = w_at_top - 1
+            if abs(base_x - cx) > limit_w:
+                continue
+            if base_y < bot_y + 1 or base_y > mound_top_y + peak_height - 0.5:
+                continue
+            if is_dark:
+                Color(*self.sand_dark)
+            else:
+                Color(*self.sand_light)
+            Rectangle(pos=(base_x - 0.75, base_y - 0.75), size=(1.5, 1.5))
 
 
 class HourglassApp(App):
@@ -427,7 +786,6 @@ class HourglassApp(App):
         root = BoxLayout(orientation="vertical", spacing=dp(4),
                          padding=[dp(8), dp(8), dp(8), dp(8)])
 
-        # 第 1 行
         top1 = BoxLayout(orientation="horizontal", size_hint=(1, None),
                          height=dp(44), spacing=dp(6))
         top1.add_widget(Label(text="周期(秒):", size_hint=(None, 1), width=dp(70),
@@ -441,13 +799,13 @@ class HourglassApp(App):
         set_btn = Button(text="设置", size_hint=(None, 1), width=dp(60), font_size=sp(14))
         set_btn.bind(on_press=self._on_set_duration)
         top1.add_widget(set_btn)
-        top1.add_widget(Widget())  # spacer
-        self.sound_btn = Button(text="音效已开", size_hint=(None, 1), width=dp(100), font_size=sp(14))
+        top1.add_widget(Widget())
+        self.sound_btn = Button(text="音效已开", size_hint=(None, 1),
+                                width=dp(100), font_size=sp(14))
         self.sound_btn.bind(on_press=self._on_toggle_sound)
         top1.add_widget(self.sound_btn)
         root.add_widget(top1)
 
-        # 第 2 行: 6 色块
         top2 = BoxLayout(orientation="horizontal", size_hint=(1, None),
                          height=dp(40), spacing=dp(4))
         self.color_btns = []
@@ -462,17 +820,14 @@ class HourglassApp(App):
             self.color_btns.append((name, btn))
         root.add_widget(top2)
 
-        # 时间
         self.time_label = Label(text="60.0s / 60s", font_size=sp(20), bold=True,
                                 size_hint=(1, None), height=dp(36),
                                 color=(0.2, 0.2, 0.2, 1))
         root.add_widget(self.time_label)
 
-        # 沙漏画布
         self.hourglass = HourglassWidget(size_hint=(1, 1))
         root.add_widget(self.hourglass)
 
-        # 底部
         bottom = BoxLayout(orientation="horizontal", size_hint=(1, None),
                            height=dp(56), spacing=dp(6))
         self.toggle_btn = Button(text="下落", font_size=sp(18), bold=True)
@@ -483,7 +838,6 @@ class HourglassApp(App):
         bottom.add_widget(reset_btn)
         root.add_widget(bottom)
 
-        # 默认选中金沙(第一项)
         self._mark_selected("金沙")
 
         return root
@@ -516,11 +870,9 @@ class HourglassApp(App):
 
     def update_time(self, remaining_sec, duration, running=False):
         self.time_label.text = f"{remaining_sec:.1f}s / {duration:.0f}s"
-        # 漏完瞬间统一恢复按钮
         if not running and remaining_sec <= 0.001 and self.toggle_btn.text == "停止":
             self.toggle_btn.text = "下落"
 
-    # Android 生命周期
     def on_pause(self):
         return True
 
