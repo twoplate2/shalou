@@ -224,7 +224,7 @@ __pycache__/
 | 闪屏后黑屏 | `presplash_color` ≠ app 背景 | spec 改 `android.presplash_color = #你的BG色` |
 | **APK 装手机后所有汉字显示为豆腐块/乱码** | Android 系统不带中文字体,Kivy 默认 Roboto 字体不含 CJK 字形 | 项目里加 `fonts/NotoSansSC-Medium.otf`(~8MB,见下方[中文字体配置](#-中文字体配置)) + `LabelBase.register(name="Roboto", fn_regular=...)` 覆盖默认字体 + spec `source.include_patterns` 加 `fonts/*.otf` |
 | App 切后台回来 GL 黑屏 | 没实现生命周期 | `on_pause` 返 True, `on_resume` 重载音频/纹理 |
-| **Android 上短 wav 循环每隔几秒"咔"一下/有断续** | Kivy `SoundLoader` 在 Android 底层走 Java `MediaPlayer.setLooping(True)`,该 API 循环短音频每次切换有 50-100ms 静音 gap | 用 `pyjnius` 调 `android.media.SoundPool`(为短音效设计,内存预解码 + 硬件循环,无缝重复)。`requirements` 加 `pyjnius`,见下方[音效无缝循环](#-音效无缝循环-android) |
+| **Android 上短 wav 循环每隔几秒"咔"一下/有断续** | Kivy `SoundLoader` 在 Android 底层走 Java `MediaPlayer.setLooping(True)`,该 API 循环短音频每次切换有 50-100ms 静音 gap | **两步并用**: (a) `pyjnius` 调 `android.media.SoundPool` 替换 MediaPlayer,(b) wav 改长 (15s) + overlap-add crossfade 消除边界量化 click——只换 SoundPool 仍可能有每 ~10s 一次的微小残余 click。见下方[音效无缝循环](#-音效无缝循环-android) |
 | **TextInput 文字无法居中** (没有 `text_align` 属性) | Kivy `TextInput` 设计缺陷,只暴露 `padding` 没暴露 `align` | 写子类用 `CoreLabel` 测真实文本宽度 → 动态计算 `padding=[(w-tw)/2, (h-th)/2, ...]`,bind `text`/`size`/`font_size` 自动刷新 |
 | Windows 双击 .py 闪退 | tk.Frame 的 padx/pady 不接受 tuple | 把 padx/pady 移到 `pack()` 调用,或换 ttk.Frame.padding |
 
@@ -556,7 +556,45 @@ class _SoundProxy:
 2. **双 SoundLoader 实例对换**: 用 `Clock.schedule_once` 在快播完前 0.1s 启动第二个实例,可以掩盖 gap,但同步精度难控
 3. **OGG 替代 WAV**: 没用,gap 来自 MediaPlayer API 本身,不是解码格式问题
 
-只有 SoundPool 能做到真无 gap。
+---
+
+### ⚠️ SoundPool 之后还有第二层坑:wav 自身边界 click
+
+**只换到 SoundPool 还不够。** 本项目 2026-05-21 装机实测,SoundPool 把 50-100ms 的 gap 消掉了,但用户仍在 ~10s 间隔听到一次微小"咔"——比 MediaPlayer 时代隐蔽得多但确实存在。
+
+**根因**: 老 wav 是 2s,生成代码 `y[i] = x[i] - 0.7*y[i-1]` 只保证**滤波器状态在 i=0 用 y[-1]** 是连续的(防止 DC 跳变),**但白噪声序列本身在边界是离散跳变**——`whites[n-1]` 跟 `whites[0]` 完全无关。量化到 int16 时这个跳变会产生一个频谱毛刺,人耳作为"咔"感知。SoundPool 自身的循环是无缝的,但你给它的 wav 边界本身就有问题。
+
+**修复 (2 步并用,本项目验证可行)**:
+
+1. **wav 改长**: 2s → 15s。即使有边界 click,频次从每 2s 降到每 15s,大幅降低听觉干扰频率。SoundPool 单样本上限 ~1MB,22050Hz mono 16-bit × 15s = 660KB,在限内。
+
+2. **overlap-add crossfade 真消除 click**:
+
+   ```python
+   # tools/generate_sand_loop.py 关键逻辑
+   n_extended = n + crossfade           # 多生成 1s 的样本
+   whites = [random... for _ in range(n_extended)]
+   filtered = [...]                      # 高通滤波,filter[0] 用 whites[-1] 兜底
+   
+   samples = list(filtered[:n])
+   for i in range(crossfade):
+       t = i / crossfade  # 0 → 1
+       # 把 [n..n+crossfade-1] 渐变叠到 [0..crossfade-1]
+       samples[i] = filtered[n + i] * (1 - t) + filtered[i] * t
+   ```
+
+   播放时序: `..., sample[n-1], sample[0], sample[1], ...`
+   - `sample[n-1] = filtered[n-1]`(crossfade 区域之外,不变)
+   - `sample[0] = filtered[n] * 1 + filtered[0] * 0 = filtered[n]`
+   
+   关键洞察: `filtered[n-1]` → `filtered[n]` 是**同一个噪声生成 pass 内的连续样本**,自然无 click。crossfade 区域 `[0..crossfade-1]` 平滑过渡到非 crossfade 区域 `[crossfade..n-1]` 也是连续的。
+
+**生成器**: `tools/generate_sand_loop.py`,运行一次覆盖 `sand_loop.wav`。
+
+**写完测的检查清单**:
+- 桌面 `python main.py` 跑 30s+,听不到 click(桌面侧 SoundLoader 仍走 MediaPlayer 但 wav 够长 click 极稀)
+- APK 装机听 1 分钟,边界处不再"咔"
+- 切周期 → reset → 重启沙漏,确认 SoundPool 没有副作用积累
 
 ---
 
@@ -571,12 +609,22 @@ class _SoundProxy:
 ## 本项目验证案例
 
 - 桌面版: `..\hourglass.py` (tkinter,~700 行)
-- Android 版: 本目录 (Kivy MVP,~330 行)
+- Android 版: 本目录 (Kivy 精美化版,~720 行)
 - GitHub: https://github.com/twoplate2/shalou
-- **关键调试历史**:
+- **关键调试历史 (2026-05-20 → 2026-05-21)**:
   - 前 4 次 push 全部失败,反复尝试用 `PYTHON3_VERSION` / `P4A_PYTHON_VERSION` / `PYTHON_VERSION` 环境变量和 `p4a.python_version` spec key 强制 Python 3.12 — 全部无效(p4a 都不读这些)
   - 第 5 次首次试 `p4a.branch = 2024.1.21`(tag 名格式错),报 `Remote branch not found`
-  - 第 6 次改成正确格式 `v2024.01.21`,**构建成功**(2026-05-21 验证)
+  - 第 6 次改成正确格式 `v2024.01.21`,**首次构建成功**
+  - APK 装机后陆续暴露 5 个新坑,逐个修(都是装机才能复现的,云构建本身是绿勾):
+    - 中文乱码 → 打包 Noto Sans SC + `LabelBase.register(name="Roboto", ...)` 全局覆盖
+    - 短 wav 循环 2-3s 一次"咔" → `pyjnius` 调 `SoundPool` 替换 MediaPlayer
+    - TextInput 数字未居中 → `CenterTextInput` 子类用 CoreLabel 测宽度算 padding
+    - 漏完后下沙堆比上沙仓还高 → `MOUND_MAX_FILL` 上下对称
+    - 应用名/按钮文案打磨 → 改"跳跳的沙漏"
+  - 进一步精美化 (commit `8021f1b`): Mesh 沙体 + 漏斗坑 + 装饰颗粒 + 沙堆塌陷动画 + 颈部物理一致性 (uniform 填满缝隙、shrink 延后 6px、入颈起点、涌出沙柱) + 渐变粒子 + 触底反弹/闪光 + 完成尘埃
+  - 同 commit 还修了 2 个用户实测反馈:
+    - 上下满到顶/底显假 → `SAND_FILL_RATIO = 0.80`,各留 20% 余量
+    - SoundPool 后仍 ~10s 一次微小 click → wav 改 15s + overlap-add crossfade,边界变成噪声序列的自然延续
 
 ---
 
