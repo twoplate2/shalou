@@ -54,10 +54,9 @@ GLASS_SHADOW = (0.78, 0.83, 0.85, 1.0)
 WOOD_FILL = "#8b6f47"
 WOOD_GRAIN = (0.435, 0.349, 0.22, 1.0)
 
-# 上沙线性下降 (容器是截顶锥, 纯立方根会让前期下降不明显)
-# 下沙立方根 + 0.9 因子 (3600s 时 fallen=0.001 → 高度 9% 立刻可见, 留 10% 空气)
-UPPER_SAND_FACTOR = 1.0
-LOWER_SAND_FACTOR = 0.9
+# 上下沙都用线性: 上沙高度 = H * remaining, 下沙高度 = H * fallen,
+# 两者之和恒等于半仓高 H, fallen=1 时下沙顶刚好到颈部. 立方根公式会让
+# 长周期下沙刚开始就堆 10%+ 而上沙几乎没动, 视觉上不守恒, 不要再用了.
 WAV_FILENAME = "sand_loop.wav"
 
 CURVE_STEPS = 16
@@ -361,10 +360,7 @@ class HourglassWidget(Widget):
     def get_mound_top_y(self):
         g = self.get_geom()
         fallen = 1 - self.get_remaining()
-        if fallen <= 0.001:
-            return g["bot_y"]
-        sand_h = (g["neck_y"] - g["bot_y"]) * (fallen ** (1.0 / 3.0)) * LOWER_SAND_FACTOR
-        return g["bot_y"] + sand_h
+        return g["bot_y"] + (g["neck_y"] - g["bot_y"]) * fallen
 
     def _w_at_y(self, y, glass_top, neck_y, bot_y, top_w, neck_w):
         """玻璃在 y 处的横向半宽"""
@@ -730,7 +726,7 @@ class HourglassWidget(Widget):
     def _draw_top_sand(self, cx, top_y, neck_y, bot_y, top_w, neck_w,
                        remaining, fallen):
         """画上沙体 Mesh + 侧壁描边 + 层理 + 装饰颗粒"""
-        sand_top_y = neck_y + (top_y - neck_y) * remaining * UPPER_SAND_FACTOR
+        sand_top_y = neck_y + (top_y - neck_y) * remaining
         w_at_top = self._w_at_y(sand_top_y, top_y, neck_y, bot_y, top_w, neck_w)
 
         # 漏斗坑深度,clip 到不能伸进颈部下方
