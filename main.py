@@ -54,7 +54,10 @@ GLASS_SHADOW = (0.78, 0.83, 0.85, 1.0)
 WOOD_FILL = "#8b6f47"
 WOOD_GRAIN = (0.435, 0.349, 0.22, 1.0)
 
-SAND_FILL_RATIO = 0.80  # 上下沙体最大填充比 (留 20% 的余量,避免顶/底贴满显假)
+# 3D 锥模型: 体积 ∝ 高度³ → 高度 ∝ 体积^(1/3)
+# 上沙因子 1.0 (满仓), 下沙因子 0.9 (99.9% 模型: 同样体积下沙高度 = 上沙的 90%)
+UPPER_SAND_FACTOR = 1.0
+LOWER_SAND_FACTOR = 0.9
 WAV_FILENAME = "sand_loop.wav"
 
 CURVE_STEPS = 16
@@ -283,7 +286,7 @@ class HourglassWidget(Widget):
         fallen = 1 - self.get_remaining()
         if fallen <= 0.001:
             return g["bot_y"]
-        sand_h = (g["neck_y"] - g["bot_y"]) * fallen * SAND_FILL_RATIO
+        sand_h = (g["neck_y"] - g["bot_y"]) * (fallen ** (1.0 / 3.0)) * LOWER_SAND_FACTOR
         return g["bot_y"] + sand_h
 
     def _w_at_y(self, y, glass_top, neck_y, bot_y, top_w, neck_w):
@@ -550,7 +553,7 @@ class HourglassWidget(Widget):
         top_w, neck_w, cap_h = g["top_w"], g["neck_w"], g["cap_h"]
         remaining = self.get_remaining()
         fallen = 1 - remaining
-        mound_top_base = bot_y + (neck_y - bot_y) * fallen * SAND_FILL_RATIO
+        mound_top_base = self.get_mound_top_y()
         now = time.time()
 
         with self.canvas:
@@ -650,11 +653,11 @@ class HourglassWidget(Widget):
     def _draw_top_sand(self, cx, top_y, neck_y, bot_y, top_w, neck_w,
                        remaining, fallen):
         """画上沙体 Mesh + 侧壁描边 + 层理 + 装饰颗粒"""
-        sand_top_y = neck_y + (top_y - neck_y) * remaining * SAND_FILL_RATIO
+        sand_top_y = neck_y + (top_y - neck_y) * (remaining ** (1.0 / 3.0)) * UPPER_SAND_FACTOR
         w_at_top = self._w_at_y(sand_top_y, top_y, neck_y, bot_y, top_w, neck_w)
 
         # 漏斗坑深度,clip 到不能伸进颈部下方
-        dip_depth = max(0.0, fallen - 0.05) * 14
+        dip_depth = (fallen ** (1.0 / 3.0)) * 16
         dip_depth = min(dip_depth, max(0.0, sand_top_y - neck_y - 2))
 
         n = CURVE_STEPS
@@ -713,7 +716,7 @@ class HourglassWidget(Widget):
         w_at_top = self._w_at_y(mound_top_y, top_y, neck_y, bot_y, top_w, neck_w)
 
         # 中央堆尖,clip 到不能高过颈部
-        peak_height = max(0.0, fallen - 0.10) * 10
+        peak_height = (fallen ** (1.0 / 3.0)) * 12
         peak_height = min(peak_height, max(0.0, neck_y - mound_top_y - 2))
 
         peak_center = 0.5 + max(-0.2, min(0.2, self.mound_peak_offset / max(1.0, w_at_top * 2)))
