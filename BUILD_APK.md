@@ -6,12 +6,29 @@
 
 ---
 
+## TL;DR (2026 年踩坑后的最稳组合)
+
+```
+Kivy 2.3.0  +  python-for-android v2024.01.21  +  buildozer 1.5.0  +  cython<3.0  +  host Python 3.10
+```
+
+**最关键的一行配置**(没有它必失败):
+```ini
+# buildozer.spec
+p4a.branch = v2024.01.21
+```
+
+为什么这行至关重要,见下方 [Python 版本陷阱](#-python-版本陷阱-2026-年起核心) 小节。
+
+---
+
 ## 技术栈
 
 | 组件 | 作用 |
 |---|---|
 | **Kivy 2.3.0** | 跨平台 Python GUI,支持打包 Android。tkinter 不能直接转 Android,要重写 |
-| **Buildozer** | Kivy 官方打包工具,用 python-for-android 把 Python + 依赖编译进 APK |
+| **Buildozer 1.5.0** | Kivy 官方打包工具,调用 python-for-android 编译 APK。**必须锁版本**,否则装最新版可能引入新坑 |
+| **python-for-android (p4a) v2024.01.21** | buildozer 底层调用的工具,负责把 Python 解释器和依赖编译进 APK。**必须锁 2024 年 tag**,见陷阱小节 |
 | **GitHub Actions** | 云端 Ubuntu 22.04 runner,跑 Buildozer + 上传 APK 产物 |
 | **Git Credential Manager** | Windows 下 push 自动用缓存的 GitHub 凭证(不用每次输密码) |
 
@@ -75,6 +92,12 @@ source.include_exts = py,png,jpg,kv,atlas,ttf,otf,wav,mp3
 source.include_patterns = sand_loop.wav   # 显式列非 .py 资源,否则不会进 APK
 version = 0.1.0
 requirements = python3,kivy==2.3.0
+
+# ⚠️ 关键:锁定 python-for-android 到 2024 年的 tag
+# 不锁的话,2026 年的新版 p4a 默认下载 Python 3.14 alpha,与 Kivy 2.3 C API 不兼容必失败
+# tag 名格式必须严格:v + 年份.月份补零.日期补零(写错任何一处 git clone 都会失败)
+p4a.branch = v2024.01.21
+
 orientation = portrait
 fullscreen = 0
 android.api = 31
@@ -107,7 +130,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: '3.10'   # 不要用 3.11+, Kivy 2.3 兼容性最好
+          python-version: '3.10'   # host Python(给 buildozer 用),与嵌入 APK 的 target Python 是两回事
       - uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
@@ -122,22 +145,24 @@ jobs:
             libncurses-dev libncursesw5-dev libtinfo6 cmake \
             libffi-dev libssl-dev automake
 
-      - name: Install buildozer & Cython
+      - name: Install buildozer & Cython (锁 2024 兼容版本)
         run: |
           python -m pip install --upgrade pip wheel
-          pip install "cython<3.0" buildozer    # cython 必须 < 3.0
+          pip install "cython<3.0" "buildozer==1.5.0"   # 两个都必须锁版本
 
       - uses: actions/cache@v5
         with:
           path: |
             ~/.buildozer
             .buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-v3-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-v3-${{ runner.os }}-
 
       - name: Build APK (debug)
         run: yes | buildozer android debug
         env:
-          PYTHON3_VERSION: "3.12"   # ⚠️ 必须锁死! 见下方"Python 版本陷阱"
+          BUILDOZER_WARN_ON_ROOT: "0"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -146,6 +171,8 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 ```
+
+> 如果之前有失败的构建留下了脏缓存,把 cache key 的 `v3` 升到 `v4`(任意改个数字都行),会强制丢弃旧缓存重头来。
 
 ### `.gitignore` — 至少这几条
 
@@ -185,38 +212,206 @@ __pycache__/
 
 ## 常见错误与解法
 
-| 错误 | 原因 | 解法 |
+| 错误信息(节选) | 原因 | 解法 |
 |---|---|---|
-| `_PyLong_AsByteArray` too few arguments (expected 6, have 5) | python-for-android 默认下载 **Python 3.14 alpha**(2026 年起),其 C API 签名变了 | workflow Build 步骤加 `env: PYTHON3_VERSION: "3.12"`(见下文详解);同时改 buildozer.spec 任意行注释来破缓存 hash |
-| `Cython compilation failed` | Cython 3.x 不兼容 p4a | spec 锁 `pip install "cython<3.0"` |
+| `_PyLong_AsByteArray` too few arguments (expected 6, have 5) | p4a 默认下 Python 3.14 alpha,C API 变了,Kivy 2.3 编译失败 | spec 加 `p4a.branch = v2024.01.21` |
+| `fatal: Remote branch X not found in upstream origin` | `p4a.branch` 的 tag 名格式错 | 必须 `v2024.01.21`(带 v + 月日补零),不是 `2024.1.21` 也不是 `2024.01.21` |
+| `Cython compilation failed` / `error in Cython` | Cython 3.x 不兼容 Kivy 2.3 / 老 p4a | workflow 锁 `pip install "cython<3.0"` |
 | `JAVA_HOME not set` | runner 没配 Java | `actions/setup-java@v5` + `java-version: '17'` |
-| `NDK download timeout` | Google CDN 偶发 | retry workflow,通常二次能过 |
+| `NDK download timeout` / SDK 下载失败 | Google CDN 偶发 | 重跑 workflow,通常二次能过(或换时段) |
 | `KeyError: 'AndroidManifest.xml'` | api/minapi/ndk 版本不匹配 | 锁 api=31, minapi=21, ndk=25b |
 | Resource not found at runtime | wav/png 没进 APK | spec 加 `source.include_patterns = xxx.wav` |
 | 闪屏后黑屏 | `presplash_color` ≠ app 背景 | spec 改 `android.presplash_color = #你的BG色` |
+| **APK 装手机后所有汉字显示为豆腐块/乱码** | Android 系统不带中文字体,Kivy 默认 Roboto 字体不含 CJK 字形 | 项目里加 `fonts/NotoSansSC-Medium.otf`(~8MB,见下方[中文字体配置](#-中文字体配置)) + `LabelBase.register(name="Roboto", fn_regular=...)` 覆盖默认字体 + spec `source.include_patterns` 加 `fonts/*.otf` |
 | App 切后台回来 GL 黑屏 | 没实现生命周期 | `on_pause` 返 True, `on_resume` 重载音频/纹理 |
 | Windows 双击 .py 闪退 | tk.Frame 的 padx/pady 不接受 tuple | 把 padx/pady 移到 `pack()` 调用,或换 ttk.Frame.padding |
 
-### ⚠️ Python 版本陷阱 (2026 年新增)
+---
 
-python-for-android 现在**默认下载 Python 3.14 alpha**（2026 年 3.14 已进入开发期）。Python 3.14 修改了 C API:
+## ⚠️ Python 版本陷阱 (2026 年起,核心)
 
+**这是一个会让所有 2024 年还能跑的旧 buildozer.spec 在 2026 年全部失败的"时间炸弹"**——本项目踩了 4 次坑才搞清楚,记录完整以便后续避坑。
+
+### 现象
+
+构建日志中编译 `kivy/graphics/compiler.c` 时报:
 ```
+error: too few arguments to function call, expected 6, have 5
+                                                  is_little, !is_unsigned);
+.../python3.14/cpython/longobject.h:84:17: note: '_PyLong_AsByteArray' declared here
+```
+
+### 根因
+
+python-for-android (p4a) 在 2026 年默认下载 **Python 3.14 alpha** 作为嵌入到 APK 的 target Python。Python 3.14 修改了 C API:
+
+```c
 // Python 3.13 及之前 — 5 个参数
 int _PyLong_AsByteArray(PyLongObject* v, unsigned char* bytes, size_t n,
                         int little_endian, int is_signed);
 
-// Python 3.14 — 6 个参数（新增 is_unsigned）
+// Python 3.14 — 6 个参数(新增 is_unsigned)
 int _PyLong_AsByteArray(PyLongObject* v, unsigned char* bytes, size_t n,
                         int little_endian, int is_signed, int is_unsigned);
 ```
 
-Kivy 2.3.0 的 Cython 生成代码（`kivy/graphics/compiler.c`）调用旧版 5 参数签名 → 编译报错:
-```
-error: too few arguments to function call, expected 6, have 5
+Kivy 2.3.0 的 Cython 生成代码 (`kivy/graphics/compiler.c`) 是按旧版 5 参数签名调用的,链接到 3.14 的头文件就编译不过。
+
+### ⛔ 不要走的弯路
+
+下面 5 条**全部无效**(本项目 4 次 push 全部踩过),节省你的时间:
+
+| 尝试的修复 | 为什么不行 |
+|---|---|
+| workflow `env: PYTHON3_VERSION: "3.12"` | p4a 根本不读这个环境变量名 |
+| workflow `env: P4A_PYTHON_VERSION: "3.12"` | p4a 也不读这个,纯属臆测的命名 |
+| workflow `env: PYTHON_VERSION: "3.12"` | 这只影响 host 侧 setup-python,与嵌入 APK 的 target Python 完全是两回事 |
+| spec 加 `p4a.python_version = 3.12` | **buildozer 不识别这个 key**,被静默忽略,完全没作用 |
+| 删 `~/.buildozer/.../Python-3.14*` 文件 | 治标,p4a 重新跑会按 recipe 默认值再下一次 |
+
+### ✅ 正确解法:锁 p4a 版本
+
+让 buildozer 用 2024 年的 p4a tag(那时 p4a 默认 Python 还是 3.10/3.11):
+
+**第一步:`buildozer.spec` 添加**
+```ini
+p4a.branch = v2024.01.21
 ```
 
-**唯一解法**: workflow Build 步骤设置 `env: PYTHON3_VERSION: "3.12"` 强制 python-for-android 下载 Python 3.12。同时需要修改 `buildozer.spec` 任意行注释来破坏 GitHub Actions 缓存 hash（否则会复用上次失败的 Python 3.14 build）。
+`p4a.branch` 这个 key 是 buildozer 真正识别的,会触发 `git clone -b <branch> https://github.com/kivy/python-for-android.git`。
+
+**第二步:tag 名格式必须严格** ⚠️
+
+| 写法 | 结果 |
+|---|---|
+| `p4a.branch = v2024.01.21` | ✅ 正确(本项目 2026-05-21 验证可用) |
+| `p4a.branch = 2024.1.21` | ❌ `fatal: Remote branch 2024.1.21 not found`(月份没补零、缺 v 前缀) |
+| `p4a.branch = 2024.01.21` | ❌ 同上(缺 v 前缀) |
+| `p4a.branch = V2024.01.21` | ❌ 大小写敏感 |
+
+要查实际可用的 tag 列表:
+```bash
+git ls-remote --tags https://github.com/kivy/python-for-android.git
+```
+
+**第三步:workflow 同步锁 buildozer 版本**
+```yaml
+pip install "cython<3.0" "buildozer==1.5.0"
+```
+
+避免新版 buildozer 引入的不兼容行为(比如 spec key 解析变化)覆盖你的配置。
+
+**第四步(可选):破旧缓存**
+
+如果之前失败过,GitHub Actions 缓存里可能残留 Python 3.14 的下载产物。改 cache key 强制丢弃:
+```yaml
+key: buildozer-v3-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+#            ^^ 把 v3 改成 v4 / v5,任意改个不一样的就行
+```
+
+### 未来可考虑的更新路径
+
+如果想跟进新 Python 版本,可以试:
+- **p4a tag 升到 `v2026.05.09`** — 2026 年 5 月发布的新 stable,理论上已修复 Python 3.14 兼容
+- **Kivy 升到 2.4 / 2.5** — 新版 Cython 应已适配 Python 3.14 的新 C API
+
+但**升级前先备份能跑的 spec**——目前(2026-05-21)已知最稳定的就是顶部 TL;DR 那套组合。
+
+---
+
+## 🀄 中文字体配置
+
+### 现象
+
+APK 装到手机后,所有汉字显示成豆腐块(□□□□)或方框乱码,而英文/数字正常。桌面预览(`python main.py` 在 Windows 上)看不到这个问题,**只在装到 Android 手机后才暴露**。
+
+### 根因
+
+- Android 系统不带中文字体(只有少量预装机型例外)
+- Kivy 默认字体名 `Roboto` 是 Google 拉丁字母字体,**不含任何 CJK 字形**
+- 所有 `Label` / `Button` 的中文文本渲染时找不到字形 → 落回 .notdef 字形 = 豆腐块
+
+### ✅ 标准解法 (3 步)
+
+#### 第 1 步:下载中文字体
+
+推荐 **Noto Sans SC Medium**(`NotoSansSC-Medium.otf`,~8MB OTF subset 版):
+
+- 来源: https://github.com/notofonts/noto-cjk → `Sans/SubsetOTF/SC/`
+- 为什么用 Medium 不用 Regular: Regular 在手机上笔画偏细发飘,Medium 的视觉重量与 iOS / Material 系应用一致
+- 为什么用 OTF 不用 TTF: notofonts 官方 subset 版只发 OTF,SDL2/freetype 在 Android 上能透明解析
+- **注意**: Noto Sans SC 是 Apache 2.0 开源协议,可商用 + 可分发
+
+放到项目目录:
+```
+project/
+└── fonts/
+    └── NotoSansSC-Medium.otf
+```
+
+#### 第 2 步:`main.py` 注册字体覆盖默认 Roboto
+
+在所有 `from kivy.uix.* import ...` 之后,创建任何 `App` / `Label` 之前,**最早期注册**:
+
+```python
+import os
+from kivy.core.text import LabelBase
+
+_FONT_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "fonts",
+    "NotoSansSC-Medium.otf",
+)
+try:
+    if os.path.exists(_FONT_PATH):
+        # 关键:用 name="Roboto" 覆盖 Kivy 默认字体名,所有控件自动生效
+        LabelBase.register(name="Roboto", fn_regular=_FONT_PATH)
+except Exception:
+    pass
+```
+
+> **关键技巧**: `name="Roboto"` 不是笔误——Kivy 内部所有 `Label` / `Button` 默认 `font_name="Roboto"`,我们用同名注册就能**全局覆盖**,不用给每个控件单独加 `font_name=` 参数。
+
+如果想更显式(不覆盖默认),可以用其他名字注册,然后控件里加 `font_name="zh"`,但要逐个改:
+```python
+LabelBase.register(name="zh", fn_regular=_FONT_PATH)
+# 然后:
+Label(text="中文", font_name="zh")
+Button(text="确定", font_name="zh")  # 漏一个就乱码
+```
+
+#### 第 3 步:`buildozer.spec` 把字体打进 APK
+
+```ini
+source.include_exts = py,png,jpg,kv,atlas,ttf,otf,wav,mp3
+# ↑ 已包含 otf,光这行还不够,子目录里的文件需要 include_patterns 显式列出
+
+source.include_patterns = sand_loop.wav,fonts/*.otf
+# ↑ fonts/*.otf 必须加,否则 fonts 子目录不会被打包,APK 里找不到字体文件 → 仍然乱码
+```
+
+### ❌ 常见失败原因
+
+| 现象 | 原因 |
+|---|---|
+| 桌面跑没问题,Android 上还是乱码 | 字体文件没进 APK → spec 没加 `fonts/*.otf` 到 `source.include_patterns` |
+| 仅部分 Label 显示中文,部分乱码 | 用了非默认字体名(如 `name="zh"`),漏了给某些控件设 `font_name=` |
+| `LabelBase.register` 报错 `IOError` | 字体路径错,要用 `__file__` 推算的绝对路径,不要写相对 `"fonts/..."` |
+| APK 体积突然 +10MB | 正常,Noto Sans SC Medium 本身就 8MB 左右,这是中文字体的物理体积下限 |
+
+### 备选字体
+
+如果 8MB 嫌太大可以换:
+
+| 字体 | 大小 | 协议 | 备注 |
+|---|---|---|---|
+| Noto Sans SC Medium | ~8MB | OFL/Apache 2.0 | 推荐,平衡视觉效果和大小 |
+| Noto Sans SC Regular | ~7MB | OFL/Apache 2.0 | 笔画细,手机上不如 Medium |
+| 文泉驿微米黑 | ~5MB | GPL-3 + 字体例外 | 可商用,但部分罕见字缺失 |
+| 思源黑体 (Source Han Sans) | ~10MB+ | OFL | Adobe 出品,与 Noto Sans CJK 同源 |
+| 微软雅黑 / 黑体 (`msyh.ttc`) | ~15MB+ | **商业字体,不可分发** | 不要用 |
+
+⚠️ **不要用 Windows 自带的微软雅黑、黑体、宋体**——这些是商业字体,把它们打包进 APK 上传 GitHub 公开仓库属于侵权。Noto Sans SC 是 Apache 2.0,可放心商用 + 公开分发。
 
 ---
 
@@ -233,7 +428,10 @@ error: too few arguments to function call, expected 6, have 5
 - 桌面版: `..\hourglass.py` (tkinter,~700 行)
 - Android 版: 本目录 (Kivy MVP,~330 行)
 - GitHub: https://github.com/twoplate2/shalou
-- 首次 push 到 Actions 完成 APK 产出 ~17 分钟
+- **关键调试历史**:
+  - 前 4 次 push 全部失败,反复尝试用 `PYTHON3_VERSION` / `P4A_PYTHON_VERSION` / `PYTHON_VERSION` 环境变量和 `p4a.python_version` spec key 强制 Python 3.12 — 全部无效(p4a 都不读这些)
+  - 第 5 次首次试 `p4a.branch = 2024.1.21`(tag 名格式错),报 `Remote branch not found`
+  - 第 6 次改成正确格式 `v2024.01.21`,**构建成功**(2026-05-21 验证)
 
 ---
 
@@ -242,4 +440,5 @@ error: too few arguments to function call, expected 6, have 5
 - Buildozer: https://buildozer.readthedocs.io
 - python-for-android: https://python-for-android.readthedocs.io
 - Kivy 2.3: https://kivy.org/doc/stable/
-- 模板灵感来源: `E:\AI_Tools\Clac\android\` (twoplate2/clac_ChinaStyle)
+- p4a tag 列表: `git ls-remote --tags https://github.com/kivy/python-for-android.git`
+- 模板灵感来源: `E:\AI_Tools\Clac\android\` (twoplate2/clac_ChinaStyle, 2024 年成功案例)

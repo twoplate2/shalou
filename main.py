@@ -11,6 +11,7 @@ import time
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.audio import SoundLoader
+from kivy.core.text import LabelBase
 from kivy.core.window import Window
 from kivy.graphics import Color, Rectangle, Line, Quad
 from kivy.metrics import dp, sp
@@ -20,6 +21,20 @@ from kivy.uix.label import Label
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 from kivy.utils import platform
+
+
+# 注册中文字体并覆盖 Kivy 默认 "Roboto" 名,使所有 Label/Button 自动渲染汉字
+# Android 系统不带中文字体,不注册的话所有汉字会显示为豆腐块
+_FONT_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "fonts",
+    "NotoSansSC-Medium.otf",
+)
+try:
+    if os.path.exists(_FONT_PATH):
+        LabelBase.register(name="Roboto", fn_regular=_FONT_PATH)
+except Exception:
+    pass
 
 
 SAND_BASE = "#d9a360"

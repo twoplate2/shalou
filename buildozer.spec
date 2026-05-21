@@ -9,7 +9,7 @@ package.domain = org.shalou
 
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,ttf,otf,wav,mp3
-source.include_patterns = sand_loop.wav
+source.include_patterns = sand_loop.wav,fonts/*.otf
 
 version = 0.1.0
 
