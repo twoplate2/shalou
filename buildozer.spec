@@ -26,6 +26,8 @@ android.ndk = 25b
 
 android.archs = arm64-v8a,armeabi-v7a
 
+# Python 3.12 locked via PYTHON3_VERSION env (3.14 alpha breaks Kivy C API)
+
 android.allow_backup = True
 
 icon.filename = %(source.dir)s/icon.png

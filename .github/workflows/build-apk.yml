@@ -54,6 +54,7 @@ jobs:
           yes | buildozer android debug
         env:
           BUILDOZER_WARN_ON_ROOT: "0"
+          PYTHON3_VERSION: "3.12"
 
       - name: Show output
         run: ls -lh bin/ || true
