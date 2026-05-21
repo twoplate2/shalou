@@ -45,9 +45,14 @@ jobs:
           path: |
             ~/.buildozer
             .buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-v2-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-${{ runner.os }}-
+            buildozer-v2-${{ runner.os }}-
+
+      - name: Nuke stale Python builds (force Python 3.12)
+        run: |
+          rm -rf .buildozer/android/platform/build-*/build/other_builds/python3/ 2>/dev/null || true
+          rm -rf ~/.buildozer/android/platform/build-*/build/other_builds/python3/ 2>/dev/null || true
 
       - name: Build APK (debug)
         run: |
