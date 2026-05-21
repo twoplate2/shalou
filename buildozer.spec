@@ -15,6 +15,9 @@ version = 0.1.0
 
 requirements = python3,kivy==2.3.0
 
+# 强制 Python 3.12（p4a 默认用 3.14 alpha，C API 变化导致 Kivy 编译失败）
+p4a.python_version = 3.12
+
 orientation = portrait
 fullscreen = 0
 
@@ -26,7 +29,7 @@ android.ndk = 25b
 
 android.archs = arm64-v8a,armeabi-v7a
 
-# Python 3.12 locked via PYTHON3_VERSION env (3.14 alpha breaks Kivy C API)
+# Python 3.12 locked via P4A_PYTHON_VERSION env + p4a.python_version
 
 android.allow_backup = True
 
