@@ -979,7 +979,7 @@ class HourglassApp(App):
             self.hourglass.save_config(self._get_color_name())
         self._update_start_btn()
 
-    def _on_toggle(self, *_=None):
+    def _on_toggle(self, *_):
         self.hourglass.set_duration(self.duration_input.text)
         self.duration_input.text = str(int(self.hourglass.duration))
         self.hourglass.toggle()
