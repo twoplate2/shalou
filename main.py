@@ -18,8 +18,8 @@ from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.text import LabelBase, Label as CoreLabel
 from kivy.core.window import Window
-from kivy.graphics import Color, Rectangle, Line, Ellipse
-from kivy.graphics import StencilPush, StencilPop, StencilUse, StencilUnUse
+from kivy.graphics import Color, Rectangle, Line, Ellipse, Mesh
+
 from kivy.metrics import dp, sp
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
@@ -814,27 +814,38 @@ class HourglassWidget(Widget):
                 Rectangle(pos=self.pos, size=self.size)
 
     def _draw_sand_chord(self, yc, Ri, cut_y, above):
-        """用 Stencil 裁剪画出球内壁被 cut_y 截出的弓形。
-        above=True: 画 cut_y 以上部分(Kivy y 向上, 下沙)
+        """用 Mesh triangle_fan 画球内壁被 cut_y 截出的弓形(不用 Stencil,避免兼容性问题)。
+        above=True: 画 cut_y 以上部分(Kivy y 向上, 下沙堆)
         above=False: 画 cut_y 以下部分(上沙)"""
-        x0, y0 = self.pos
-        w, h = self.size
         cx = self._cx
+        dy = cut_y - yc
+        # 弓形太小或截线在球外 → 不画
+        if above and dy >= Ri:
+            return
+        if not above and dy <= -Ri:
+            return
+        # 截线超出球 → 画完整椭圆
+        if (above and dy <= -Ri) or (not above and dy >= Ri):
+            Color(*self.sand_base)
+            Ellipse(pos=(cx - Ri, yc - Ri), size=(2 * Ri, 2 * Ri))
+            return
 
-        StencilPush()
-        if above:
-            # 保留 cut_y 以上(下沙堆, 从 cut_y 往上)
-            Color(1, 1, 1, 1)
-            Rectangle(pos=(x0, cut_y), size=(w, y0 + h - cut_y))
-        else:
-            # 保留 cut_y 以下(上沙, 从底部到 cut_y)
-            Color(1, 1, 1, 1)
-            Rectangle(pos=(x0, y0), size=(w, cut_y - y0))
-        StencilUse()
+        x_int = math.sqrt(max(0.0, Ri * Ri - dy * dy))
+        N = max(16, int(2 * Ri / 3))
+
+        # fan 中心 = 弓形弦线中点 (cx, cut_y)
+        verts = [cx, cut_y, 0, 0]
+        for i in range(N + 1):
+            x = cx + x_int - 2 * x_int * i / N
+            if above:
+                y = yc + math.sqrt(max(0.0, Ri * Ri - (x - cx) ** 2))
+            else:
+                y = yc - math.sqrt(max(0.0, Ri * Ri - (x - cx) ** 2))
+            verts.extend([x, y, 0, 0])
+
+        indices = list(range(len(verts) // 4))
         Color(*self.sand_base)
-        Ellipse(pos=(cx - Ri, yc - Ri), size=(2 * Ri, 2 * Ri))
-        StencilUnUse()
-        StencilPop()
+        Mesh(vertices=verts, indices=indices, mode='triangle_fan')
 
 
 # ---------- App ----------
