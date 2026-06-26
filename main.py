@@ -2,24 +2,23 @@
 沙漏 - Android Kivy 版本 (PC 完整球几何移植版)
 基于 pc/hourglass_v2.py 的完整球 + 球体积微积分 + v2 布局 + 粒子通道修复
 
-核心差异 vs 旧 Android 版:
-- 几何: 完整球(R 公式)替代锥形(线性 w_at_y)
-- 体积: v(t)=3t²-2t³ 数值积分替代线性高度
-- 渲染: Kivy Ellipse + Stencil 裁剪替代 Mesh triangle_fan 锥形
-- 布局: v2 色块上移+控件下移
-- 粒子: 通道宽度自适应尺寸
+与 PC 版对齐要点:
+- 粒子 wobble 摆动 / 5%快粒子 / splash随机尺寸
+- 沙堆中央堆尖 / 完成闪烁 / 颈部高光
+- 点击沙漏球=开始暂停 / 配置持久化
+- shrink 下限 0.5(不缩成细丝)
 """
 import math
 import os
 import random
 import time
+import json
 
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.text import LabelBase, Label as CoreLabel
 from kivy.core.window import Window
 from kivy.graphics import Color, Rectangle, Line, Ellipse, Mesh
-
 from kivy.metrics import dp, sp
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
@@ -52,21 +51,30 @@ SAND_PRESETS = [
 BG_COLOR = "#fdf6e3"
 GLASS_FILL = "#eaf3f8"
 GLASS_OUTLINE = (0.373, 0.420, 0.439, 1.0)  # #5f6b70
-GLASS_OUTLINE_W_SCALE = 0.0158  # 6/380, 壁厚占 canvas_w 比例
+GLASS_OUTLINE_W_SCALE = 0.0158  # 6/380
 
-# 沙子飞行到底时间 ≈ 1.0s
 FALL_DELAY = 1.0
 MOUND_APPEAR = 0.5
 MOUND_FLOOR_MIN = 2.5
 MOUND_FLOOR_MAX = 3.5
 MOUND_FLOOR_EFF = 0.02
 
-COLLAPSE_INTERVAL = (2.5, 4.0)
-COLLAPSE_DURATION = 0.6
 DUST_COUNT = 25
 DUST_LIFETIME = 1.0
+FLASH_DURATION = 0.35
 
 WAV_FILENAME = "sand_loop.wav"
+
+
+def _config_path():
+    if platform == "android":
+        try:
+            return os.path.join(App.get_running_app().user_data_dir,
+                                ".hourglass_config.json")
+        except Exception:
+            pass
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        ".hourglass_config.json")
 
 
 def hex_rgb(h):
@@ -91,13 +99,12 @@ def fg_for(hex_color):
     return (0, 0, 0, 1) if luma > 0.59 else (1, 1, 1, 1)
 
 
-# ---------- CenterTextInput (居中输入框) ----------
+# ---------- CenterTextInput ----------
 
 class CenterTextInput(TextInput):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.bind(text=self._refresh_pad,
-                  size=self._refresh_pad,
+        self.bind(text=self._refresh_pad, size=self._refresh_pad,
                   font_size=self._refresh_pad)
         Clock.schedule_once(self._refresh_pad, 0)
 
@@ -115,7 +122,7 @@ class CenterTextInput(TextInput):
         self.padding = [pad_h, pad_v, pad_h, pad_v]
 
 
-# ---------- 音效代理 (双 stream crossfade, 与旧版一致) ----------
+# ---------- 音效代理 ----------
 
 class _SoundProxy:
     _WAV_DURATION = 15.0
@@ -140,7 +147,6 @@ class _SoundProxy:
                 return
             except Exception:
                 self._sp = None
-
         try:
             from kivy.core.audio import SoundLoader
             self._kivy_sound = SoundLoader.load(wav_path)
@@ -258,10 +264,9 @@ class _SoundProxy:
                 pass
 
 
-# ---------- 沙漏画布 (完整球几何) ----------
+# ---------- 沙漏画布 ----------
 
 class HourglassWidget(Widget):
-    """沙漏画布。Kivy 坐标 y 向上 (top > bot)。完整球 + 颈部圆柱管。"""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -277,7 +282,6 @@ class HourglassWidget(Widget):
         self._color_table = []
         self._rebuild_color_table()
 
-        # 球几何(延迟到 size 确定后重建)
         self._geom_ready = False
         self._R = 0.0
         self._R_inner = 0.0
@@ -291,9 +295,8 @@ class HourglassWidget(Widget):
         self.flares = []
         self.dusts = []
         self.mound_peak_offset = 0.0
+        self.flash_end = 0.0
 
-        self._collapse = None
-        self._next_collapse = time.time() + random.uniform(*COLLAPSE_INTERVAL)
         self._completion_triggered = False
 
         self.sound_on = True
@@ -313,7 +316,6 @@ class HourglassWidget(Widget):
 
     @property
     def neck_w(self):
-        """颈部半宽, 随 duration 缩放"""
         base = max(dp(2.5), self.width * 0.0316)  # 12/380
         factor = (60.0 / max(1.0, self.duration)) ** 0.4
         return max(dp(2), min(dp(14), base * factor))
@@ -323,20 +325,15 @@ class HourglassWidget(Widget):
         return max(0.5, min(2.5, 60.0 / max(0.1, self.duration)))
 
     def _rebuild_height_table(self):
-        """完整球体积查找表(两球 + 颈部圆柱管)"""
         w, h = self.width, self.height
         if w <= 0 or h <= 0:
             return
-
         glass_outline_w = max(dp(2), w * GLASS_OUTLINE_W_SCALE)
-        tube_h = max(dp(10), h * 0.0315)  # 23/730
-
-        # 玻璃区域
-        cap_h = max(dp(6), h * 0.022)  # 木盖
+        tube_h = max(dp(10), h * 0.0315)
+        cap_h = max(dp(6), h * 0.022)
         glass_top = self.y + h - cap_h
         glass_bot = self.y + cap_h
         neck_y = (glass_top + glass_bot) / 2
-
         ball_h = (glass_top - glass_bot - tube_h) / 2
         nw = self.neck_w
         R = (ball_h**2 + nw**2) / (2 * ball_h) if ball_h > 0 else ball_h
@@ -354,12 +351,11 @@ class HourglassWidget(Widget):
         self._lower_y_c = glass_bot + R
 
         Ri = self._R_inner
-        self._upper_sand_top = self._upper_y_c + Ri   # 上球内壁顶
-        self._upper_sand_bot = self._upper_y_c - Ri   # 上球内壁底(接管)
-        self._lower_sand_top = self._lower_y_c + Ri   # 下球内壁顶(接管)
-        self._lower_sand_bot = self._lower_y_c - Ri   # 下球内壁底
+        self._upper_sand_top = self._upper_y_c + Ri
+        self._upper_sand_bot = self._upper_y_c - Ri
+        self._lower_sand_top = self._lower_y_c + Ri
+        self._lower_sand_bot = self._lower_y_c - Ri
 
-        # 数值积分 v(t), t∈[0,1], t=0 球顶→t=1 截口
         n = 101
         dy = ball_h / (n - 1)
         prev_w2 = self._w2_at_ball_ratio(0.0)
@@ -380,12 +376,10 @@ class HourglassWidget(Widget):
         self._geom_ready = True
 
     def _w2_at_ball_ratio(self, t):
-        """球在高度比例 t 处的半宽平方(t=0 球顶, t=1 截口)"""
         y = self._glass_top - t * self._ball_h
         return max(0.0, self._R**2 - (y - self._upper_y_c)**2)
 
     def _raw_height_ratio(self, vol_ratio):
-        """体积比例 → 高度比例(raw), 二分查找表"""
         if vol_ratio <= 0:
             return 0.0
         if vol_ratio >= 1:
@@ -428,7 +422,6 @@ class HourglassWidget(Widget):
         return MOUND_FLOOR_MIN + (MOUND_FLOOR_MAX - MOUND_FLOOR_MIN) * t
 
     def _mound_height_px(self):
-        """下沙堆高度(像素)"""
         eff = self._effective_fallen()
         ball_h_px = 2 * self._R_inner
         delay = self._fall_delay
@@ -440,14 +433,17 @@ class HourglassWidget(Widget):
         return appear * target
 
     def get_mound_top_y(self):
-        """下沙堆顶 y(Kivy y 向上)"""
+        """下沙堆顶 y(Kivy y 向上)。加中央堆尖,与 PC 对齐。"""
         h = self._mound_height_px()
         if h <= 0:
             return self._lower_sand_bot
-        return self._lower_sand_bot + h
+        mound_base_y = self._lower_sand_bot + h
+        eff = self._effective_fallen()
+        peak_height = max(0.0, eff - 0.10) * 10
+        peak_height = min(peak_height, max(0.0, self._lower_sand_top - mound_base_y - 2))
+        return mound_base_y + peak_height
 
     def _sand_half_w(self, y, yc):
-        """球内壁(yc 为球心)在 y 处的半宽"""
         return math.sqrt(max(0.0, self._R_inner**2 - (y - yc)**2))
 
     # ---------- 控制 ----------
@@ -479,8 +475,7 @@ class HourglassWidget(Widget):
         self.flares = []
         self.dusts = []
         self.mound_peak_offset = 0.0
-        self._collapse = None
-        self._next_collapse = time.time() + random.uniform(*COLLAPSE_INTERVAL)
+        self.flash_end = 0.0
         self._completion_triggered = False
 
     def set_duration(self, d):
@@ -526,6 +521,26 @@ class HourglassWidget(Widget):
         if self._sound is not None:
             self._sound.stop()
 
+    # ---------- 配置持久化 ----------
+
+    def load_config(self):
+        try:
+            with open(_config_path(), 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def save_config(self, color_name):
+        try:
+            with open(_config_path(), 'w', encoding='utf-8') as f:
+                json.dump({
+                    'duration': self.duration,
+                    'color_name': color_name,
+                    'sound_on': self.sound_on,
+                }, f, ensure_ascii=False)
+        except Exception:
+            pass
+
     # ---------- tick / 物理 ----------
 
     def tick(self, _dt_kivy):
@@ -541,31 +556,16 @@ class HourglassWidget(Widget):
             if self.elapsed >= self.duration:
                 self.elapsed = self.duration
                 self.running = False
+                self.flash_end = now + FLASH_DURATION
                 self._stop_sound()
                 if not self._completion_triggered:
                     self._spawn_dust()
                     self._completion_triggered = True
-        self.update_collapse(now)
         self.update_particles(dt)
         self.redraw()
         app = App.get_running_app()
         if app is not None:
             app.update_time(max(0.0, self.duration - self.elapsed), self.duration)
-
-    def update_collapse(self, now):
-        if self._collapse is not None:
-            if now >= self._collapse["end"]:
-                self._collapse = None
-                self._next_collapse = now + random.uniform(*COLLAPSE_INTERVAL)
-        elif self.running:
-            eff_fallen = self._effective_fallen()
-            if 0.05 < eff_fallen < 0.95 and now >= self._next_collapse:
-                self._collapse = {
-                    "tt": random.uniform(0.25, 0.75),
-                    "magnitude": random.uniform(1.2, 2.4),
-                    "start": now,
-                    "end": now + COLLAPSE_DURATION,
-                }
 
     def _spawn_dust(self):
         mound_top = self.get_mound_top_y()
@@ -601,13 +601,19 @@ class HourglassWidget(Widget):
             while self.particle_acc >= 1:
                 self.particle_acc -= 1
                 x_off = random.uniform(-x_clip, x_clip)
-                # 粒子尺寸自适应通道宽: 窄通道全用 size=1
                 p_size = (2 if random.random() < 0.85 else 1) if x_clip >= 3.0 else 1
+                # 5% 快粒子,与 PC 对齐
+                if random.random() < 0.05:
+                    vy0 = -random.uniform(90, 120)
+                else:
+                    vy0 = -random.uniform(35, 60)
                 self.particles.append({
                     "x": cx + x_off,
                     "x_offset": x_off,
                     "y": self._upper_sand_bot + random.uniform(-2, 1),
-                    "vy": -random.uniform(60, 90),
+                    "vy": vy0,
+                    "wobble_phase": random.uniform(0, math.tau),
+                    "wobble_amp": random.uniform(0.4, 1.0),
                     "is_light": random.random() < 0.10,
                     "size": p_size,
                 })
@@ -625,12 +631,14 @@ class HourglassWidget(Widget):
             else:
                 eff_fallen = fallen_dist - 6
                 v_at = (v0_abs**2 + 2 * 700.0 * eff_fallen) ** 0.5
-                shrink = max(0.12, (v0_abs / v_at) ** 0.5)
+                shrink = max(0.5, (v0_abs / v_at) ** 0.5)  # 下限 0.5,与 PC 对齐
                 dist_to_floor = p["y"] - mound_top
                 if 0 < dist_to_floor < 30:
                     shrink *= 1 + (1 - dist_to_floor / 30) * 0.4
 
-            p["x"] = cx + p["x_offset"] * shrink
+            # wobble 摆动,与 PC 对齐
+            wobble = math.sin(fallen_dist * 0.07 + p["wobble_phase"]) * p["wobble_amp"]
+            p["x"] = cx + p["x_offset"] * shrink + wobble * (1 - shrink * 0.4)
 
             # 横向 clamp(扣除线宽视觉延伸)
             tube_lim = max(1.0, neck_w - glass_ow / 2)
@@ -656,6 +664,7 @@ class HourglassWidget(Widget):
                         "x": p["x"], "y": mound_top,
                         "vx": random.uniform(-35, 35),
                         "vy": random.uniform(55, 110),
+                        "size": random.choice([1, 1, 2]),
                     })
                 continue
             new_list.append(p)
@@ -692,6 +701,19 @@ class HourglassWidget(Widget):
             new_dusts.append(d)
         self.dusts = new_dusts
 
+    # ---------- 点击沙漏球 ----------
+
+    def on_touch_down(self, touch):
+        if self._geom_ready and self.collide_point(*touch.pos):
+            dx = touch.x - self._cx
+            if (dx * dx + (touch.y - self._upper_y_c) ** 2 <= self._R ** 2 or
+                    dx * dx + (touch.y - self._lower_y_c) ** 2 <= self._R ** 2):
+                app = App.get_running_app()
+                if app is not None:
+                    app._on_toggle()
+                return True
+        return super().on_touch_down(touch)
+
     # ---------- 渲染 ----------
 
     def redraw(self):
@@ -712,25 +734,20 @@ class HourglassWidget(Widget):
         nw = self.neck_w
 
         with self.canvas:
-            # === 1. 玻璃外壳 (Ellipse + Rectangle) ===
-            # 上球外壁
+            # === 1. 玻璃外壳 ===
             Color(*GLASS_OUTLINE)
             Ellipse(pos=(cx - R, upper_y_c - R), size=(2 * R, 2 * R))
-            # 上球内壁(填充色)
             Color(*hex_rgb(GLASS_FILL))
             Ellipse(pos=(cx - R + ow, upper_y_c - R + ow),
                     size=(2 * (R - ow), 2 * (R - ow)))
-            # 下球外壁
             Color(*GLASS_OUTLINE)
             Ellipse(pos=(cx - R, lower_y_c - R), size=(2 * R, 2 * R))
-            # 下球内壁
             Color(*hex_rgb(GLASS_FILL))
             Ellipse(pos=(cx - R + ow, lower_y_c - R + ow),
                     size=(2 * (R - ow), 2 * (R - ow)))
-            # 颈部管子 fill + 管壁线
             tube_w = nw
-            tube_top = upper_y_c - R + ow  # 上球内壁底
-            tube_bot = lower_y_c + R - ow  # 下球内壁顶
+            tube_top = upper_y_c - R + ow
+            tube_bot = lower_y_c + R - ow
             Color(*hex_rgb(GLASS_FILL))
             Rectangle(pos=(cx - tube_w, tube_bot),
                       size=(2 * tube_w, tube_top - tube_bot))
@@ -757,13 +774,13 @@ class HourglassWidget(Widget):
                 Line(points=[cx - cap_w, base_y + cap_h * 0.65,
                              cx + cap_w, base_y + cap_h * 0.65], width=0.8)
 
-            # === 3. 上沙体 (Stencil 裁剪弓形) ===
+            # === 3. 上沙体弓形 ===
             if remaining > 0.001:
                 eff = self._effective_fallen()
                 cut_y = u_sand_bot + (self._upper_sand_top - u_sand_bot) * (1 - self._raw_height_ratio(eff))
                 self._draw_sand_chord(upper_y_c, Ri, cut_y, above=False)
 
-            # === 4. 下沙堆 ===
+            # === 4. 下沙堆弓形 ===
             h_mound = self._mound_height_px()
             if h_mound > 0.5:
                 cut_y = self._lower_sand_bot + h_mound
@@ -776,7 +793,7 @@ class HourglassWidget(Widget):
                 Rectangle(pos=(cx - tsw, u_sand_bot),
                           size=(2 * tsw, l_sand_top - u_sand_bot))
 
-            # === 6. 沙流粒子 ===
+            # === 6. 沙流粒子(Line 拖尾,对齐 PC) ===
             for p in self.particles:
                 if p["is_light"]:
                     Color(*self.sand_light)
@@ -785,14 +802,19 @@ class HourglassWidget(Widget):
                     idx = int((self._neck_y - p["y"]) / h_total * 10)
                     idx = max(0, min(10, idx))
                     Color(*self._color_table[idx])
-                trail = max(2.0, abs(p["vy"]) * 0.05)
-                Rectangle(pos=(p["x"] - p["size"] / 2, p["y"]),
-                          size=(p["size"], trail))
+                trail = max(2.0, abs(p["vy"]) * 0.08)
+                top_y_p = max(self._neck_y, p["y"] + trail)
+                if top_y_p <= p["y"]:
+                    continue
+                Line(points=[p["x"], p["y"], p["x"], top_y_p],
+                     width=p["size"])
 
             # === 7. splash 粒子 ===
             Color(*self.sand_light)
             for s in self.splashes:
-                Rectangle(pos=(s["x"] - 0.75, s["y"] - 0.75), size=(1.5, 1.5))
+                sz = s.get("size", 1.5)
+                Rectangle(pos=(s["x"] - sz / 2, s["y"] - sz / 2),
+                          size=(sz, sz))
 
             # === 8. flares 闪光 ===
             for f in self.flares:
@@ -808,23 +830,33 @@ class HourglassWidget(Widget):
             for d in self.dusts:
                 Rectangle(pos=(d["x"], d["y"]), size=(1, 1))
 
-            # === 10. 暂停遮罩 ===
+            # === 10. 颈部高光(漏完后可见) ===
+            if remaining <= 0.001:
+                Color(0.8, 0.8, 0.8, 1)
+                Line(points=[cx - nw + 1, self._neck_y - 7,
+                             cx - nw + 1, self._neck_y + 7], width=1)
+                Line(points=[cx + nw - 1, self._neck_y - 7,
+                             cx + nw - 1, self._neck_y + 7], width=1)
+
+            # === 11. 暂停遮罩 ===
             if not self.running and 0 < self.elapsed < self.duration:
                 Color(0.99, 0.96, 0.89, 0.55)
                 Rectangle(pos=self.pos, size=self.size)
 
+            # === 12. 完成闪烁 ===
+            if now < self.flash_end:
+                Color(1, 1, 1, 0.25)
+                Rectangle(pos=self.pos, size=self.size)
+
     def _draw_sand_chord(self, yc, Ri, cut_y, above):
-        """用 Mesh triangle_fan 画球内壁被 cut_y 截出的弓形(不用 Stencil,避免兼容性问题)。
-        above=True: 画 cut_y 以上部分(Kivy y 向上, 下沙堆)
-        above=False: 画 cut_y 以下部分(上沙)"""
+        """Mesh triangle_fan 画球内壁弓形(不用 Stencil)。
+        above=True: y>=cut_y 部分(下沙堆); above=False: y<=cut_y 部分(上沙)"""
         cx = self._cx
         dy = cut_y - yc
-        # 弓形太小或截线在球外 → 不画
         if above and dy >= Ri:
             return
         if not above and dy <= -Ri:
             return
-        # 截线超出球 → 画完整椭圆
         if (above and dy <= -Ri) or (not above and dy >= Ri):
             Color(*self.sand_base)
             Ellipse(pos=(cx - Ri, yc - Ri), size=(2 * Ri, 2 * Ri))
@@ -833,7 +865,6 @@ class HourglassWidget(Widget):
         x_int = math.sqrt(max(0.0, Ri * Ri - dy * dy))
         N = max(16, int(2 * Ri / 3))
 
-        # fan 中心 = 弓形弦线中点 (cx, cut_y)
         verts = [cx, cut_y, 0, 0]
         for i in range(N + 1):
             x = cx + x_int - 2 * x_int * i / N
@@ -861,10 +892,24 @@ class HourglassApp(App):
                 pass
         Window.clearcolor = (*hex_rgb(BG_COLOR), 1)
 
+        # 加载配置
+        self.hourglass = HourglassWidget(size_hint=(1, 1))
+        cfg = self.hourglass.load_config()
+        if 'duration' in cfg:
+            self.hourglass.duration = cfg['duration']
+            self.hourglass._rebuild_height_table()
+        if 'sound_on' in cfg:
+            self.hourglass.sound_on = cfg['sound_on']
+        color_name = cfg.get('color_name', '金沙')
+        for name, base, dark, light in SAND_PRESETS:
+            if name == color_name:
+                self.hourglass.set_sand_color(base, dark, light)
+                break
+
         root = BoxLayout(orientation="vertical", spacing=dp(2),
                          padding=[dp(6), dp(4), dp(6), dp(4)])
 
-        # === v2 布局: 顶部色块 ===
+        # === 顶部色块 (v2) ===
         top_colors = BoxLayout(orientation="horizontal", size_hint=(1, None),
                                height=dp(42), spacing=dp(3))
         self.color_btns = []
@@ -879,30 +924,29 @@ class HourglassApp(App):
             self.color_btns.append((name, btn))
         root.add_widget(top_colors)
 
-        # === 倒计时(位置不变) ===
+        # === 倒计时 ===
         self.time_label = Label(text="60s / 60s", font_size=sp(20), bold=True,
                                 size_hint=(1, None), height=dp(32),
                                 color=(0.2, 0.2, 0.2, 1))
         root.add_widget(self.time_label)
 
         # === 沙漏画布 ===
-        self.hourglass = HourglassWidget(size_hint=(1, 1))
         root.add_widget(self.hourglass)
 
-        # === v2 布局: 底部控件 ===
+        # === 底部控件 (v2) ===
         bottom_ctrl = BoxLayout(orientation="horizontal", size_hint=(1, None),
                                 height=dp(48), spacing=dp(4))
         bottom_ctrl.add_widget(Label(text="周期:", size_hint=(None, 1),
                                      width=dp(52), color=(0.2, 0.2, 0.2, 1),
                                      font_size=sp(14)))
-        self.duration_input = CenterTextInput(text="60", multiline=False,
-                                              size_hint=(None, 1), width=dp(70),
-                                              font_size=sp(20),
-                                              input_filter="float")
+        self.duration_input = CenterTextInput(
+            text=str(int(self.hourglass.duration)), multiline=False,
+            size_hint=(None, 1), width=dp(70),
+            font_size=sp(20), input_filter="float")
         self.duration_input.bind(on_text_validate=self._on_set_duration)
         bottom_ctrl.add_widget(self.duration_input)
-        self.sound_btn = Button(text="音效:开", size_hint=(None, 1),
-                                width=dp(64), font_size=sp(12))
+        self.sound_btn = Button(text="音效:开" if self.hourglass.sound_on else "音效:关",
+                                size_hint=(None, 1), width=dp(64), font_size=sp(12))
         self.sound_btn.bind(on_press=self._on_toggle_sound)
         bottom_ctrl.add_widget(self.sound_btn)
         bottom_ctrl.add_widget(Widget())
@@ -918,17 +962,24 @@ class HourglassApp(App):
         bottom_ctrl.add_widget(reset_btn)
         root.add_widget(bottom_ctrl)
 
-        self._mark_selected("金沙")
+        self._mark_selected(color_name)
         return root
+
+    def _get_color_name(self):
+        for n, btn in self.color_btns:
+            if "●" in btn.text:
+                return n
+        return "金沙"
 
     def _on_set_duration(self, *_):
         changed = self.hourglass.set_duration(self.duration_input.text)
         if not changed:
             self.duration_input.text = str(int(self.hourglass.duration))
+        else:
+            self.hourglass.save_config(self._get_color_name())
         self._update_start_btn()
 
-    def _on_toggle(self, *_):
-        # 先应用周期(幂等), 再 toggle
+    def _on_toggle(self, *_=None):
         self.hourglass.set_duration(self.duration_input.text)
         self.duration_input.text = str(int(self.hourglass.duration))
         self.hourglass.toggle()
@@ -951,10 +1002,12 @@ class HourglassApp(App):
     def _on_toggle_sound(self, *_):
         on = self.hourglass.toggle_sound()
         self.sound_btn.text = "音效:开" if on else "音效:关"
+        self.hourglass.save_config(self._get_color_name())
 
     def _on_color(self, base, dark, light, name):
         self.hourglass.set_sand_color(base, dark, light)
         self._mark_selected(name)
+        self.hourglass.save_config(name)
 
     def _mark_selected(self, name):
         for n, btn in self.color_btns:
